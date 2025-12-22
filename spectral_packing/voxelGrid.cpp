@@ -210,3 +210,103 @@ void calculate_distance (const VoxelGrid &s_omega, VoxelGrid &distance_grid) {
 }
 
 #endif
+
+// Conversion functions between VoxelGrid and FlatVoxelGrid
+void voxel_grid_to_flat(const VoxelGrid &src, FlatVoxelGrid &dst) {
+    Index3 sz = get_size(src);
+    int nx = get<0>(sz), ny = get<1>(sz), nz = get<2>(sz);
+    dst.resize(nx, ny, nz);
+    for (int i = 0; i < nx; i++)
+        for (int j = 0; j < ny; j++)
+            for (int k = 0; k < nz; k++)
+                dst(i, j, k) = src[i][j][k];
+}
+
+void flat_to_voxel_grid(const FlatVoxelGrid &src, VoxelGrid &dst) {
+    resize3d(dst, src.dims());
+    for (int i = 0; i < src.nx; i++)
+        for (int j = 0; j < src.ny; j++)
+            for (int k = 0; k < src.nz; k++)
+                dst[i][j][k] = src(i, j, k);
+}
+
+FlatVoxelGrid to_flat(const VoxelGrid &src) {
+    FlatVoxelGrid dst;
+    voxel_grid_to_flat(src, dst);
+    return dst;
+}
+
+VoxelGrid to_nested(const FlatVoxelGrid &src) {
+    VoxelGrid dst;
+    flat_to_voxel_grid(src, dst);
+    return dst;
+}
+
+// Flip all 3 dimensions of a FlatVoxelGrid (x, y, z all reversed)
+void flip3d_flat(FlatVoxelGrid &a) {
+    int nx = a.nx, ny = a.ny, nz = a.nz;
+    FlatVoxelGrid flipped(nx, ny, nz);
+
+    for (int i = 0; i < nx; i++) {
+        for (int j = 0; j < ny; j++) {
+            for (int k = 0; k < nz; k++) {
+                // Map (i,j,k) to (nx-1-i, ny-1-j, nz-1-k)
+                flipped(nx - 1 - i, ny - 1 - j, nz - 1 - k) = a(i, j, k);
+            }
+        }
+    }
+    a = std::move(flipped);
+}
+
+// Pad FlatVoxelGrid to a target size
+void padto3d_flat(FlatVoxelGrid &a, Index3 padto, int value) {
+    int old_nx = a.nx, old_ny = a.ny, old_nz = a.nz;
+    auto [new_nx, new_ny, new_nz] = padto;
+
+    FlatVoxelGrid padded(new_nx, new_ny, new_nz);
+    padded.fill(value);
+
+    for (int i = 0; i < old_nx; i++) {
+        for (int j = 0; j < old_ny; j++) {
+            // Copy row by row for efficiency
+            std::memcpy(&padded(i, j, 0), &a(i, j, 0), old_nz * sizeof(int));
+        }
+    }
+    a = std::move(padded);
+}
+
+// Get bounds of non-zero voxels in a FlatVoxelGrid
+void get_voxel_grid_bounds_flat(const FlatVoxelGrid &g, Index3 &lo, Index3 &hi) {
+    int nx = g.nx, ny = g.ny, nz = g.nz;
+    lo = Index3(INF, INF, INF);
+    hi = Index3(-INF, -INF, -INF);
+
+    for (int i = 0; i < nx; i++) {
+        for (int j = 0; j < ny; j++) {
+            for (int k = 0; k < nz; k++) {
+                if (g(i, j, k) > 0) {
+                    get<0>(lo) = min(get<0>(lo), i);
+                    get<1>(lo) = min(get<1>(lo), j);
+                    get<2>(lo) = min(get<2>(lo), k);
+
+                    get<0>(hi) = max(get<0>(hi), i);
+                    get<1>(hi) = max(get<1>(hi), j);
+                    get<2>(hi) = max(get<2>(hi), k);
+                }
+            }
+        }
+    }
+}
+
+// Find positions where grid has specified value
+void where3d_flat(const FlatVoxelGrid &grid, vector<Index3> &idx, int value) {
+    int nx = grid.nx, ny = grid.ny, nz = grid.nz;
+    for (int i = 0; i < nx; i++) {
+        for (int j = 0; j < ny; j++) {
+            for (int k = 0; k < nz; k++) {
+                if (grid(i, j, k) == value)
+                    idx.emplace_back(i, j, k);
+            }
+        }
+    }
+}

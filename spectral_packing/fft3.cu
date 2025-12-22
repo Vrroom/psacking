@@ -123,22 +123,35 @@ void copyFro (ComplexList &B, fftw_complex *A, Index3 sz) {
   }
 }
 
-void to_cufft_complex (const VoxelGrid &A, cufftComplex *B, Index3 size) { 
-  int cnt = 0; 
+void to_cufft_complex (const VoxelGrid &A, cufftComplex *B, Index3 size) {
+  int cnt = 0;
   FOR_VOXEL(i, j, k, size) {
     B[cnt++] = make_float2(A[i][j][k], 0.0);
   }
 }
 
-void to_voxel_grid (const int *res, VoxelGrid &target, Index3 size) { 
-  auto [N, M, L] = size; 
-  resize3d(target, size, 0); 
-  int cnt = 0; 
-  FOR_VOXEL(i, j, k, size) {
-    // target[i][j][k] = ((int) round(res[cnt++].x)); 
-    // target[i][j][k] = ((int) res[cnt++].x); 
-    target[i][j][k] = res[cnt++]; 
+// Fast version using FlatVoxelGrid - single pass instead of triple loop
+void flat_to_cufft_complex(const FlatVoxelGrid &A, cufftComplex *B) {
+  const int* src = A.ptr();
+  size_t n = A.size();
+  for (size_t i = 0; i < n; i++) {
+    B[i] = make_float2(static_cast<float>(src[i]), 0.0f);
   }
+}
+
+void to_voxel_grid (const int *res, VoxelGrid &target, Index3 size) {
+  auto [N, M, L] = size;
+  resize3d(target, size, 0);
+  int cnt = 0;
+  FOR_VOXEL(i, j, k, size) {
+    target[i][j][k] = res[cnt++];
+  }
+}
+
+// Fast version - direct memcpy to FlatVoxelGrid
+void to_flat_grid(const int *res, FlatVoxelGrid &target, Index3 size) {
+  target.resize(size);
+  std::memcpy(target.ptr(), res, target.size_bytes());
 }
 
 void pad_voxel_grid_cuda (cufftComplex *&d_voxel_grid, Index3 orig_size, Index3 padded_size) { 
@@ -239,6 +252,97 @@ void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
   free(h_A);
   free(h_B);
   free(h_out);
+}
+
+// Fast version using FlatVoxelGrid - avoids triple-loop conversions
+void dft_conv3_flat(const FlatVoxelGrid &a, const FlatVoxelGrid &b, FlatVoxelGrid &result) {
+  int N = a.nx, M = a.ny, L = a.nz;
+
+  if (a.nx != b.nx || a.ny != b.ny || a.nz != b.nz)
+    throw std::runtime_error("Input grids must be of the same size for convolution");
+
+  Index3 padded_size = make_tuple(2 * N + 1, 2 * M + 1, 2 * L + 1);
+  auto [nx, ny, nz] = padded_size;
+  LL padded_volume = vol(padded_size);
+  LL init_volume = a.size();
+
+  cufftComplex *h_A, *h_B;
+  int *h_out;
+  {
+    h_A = (cufftComplex *) malloc(sizeof(cufftComplex) * init_volume);
+    h_B = (cufftComplex *) malloc(sizeof(cufftComplex) * init_volume);
+    h_out = (int *) malloc(sizeof(int) * padded_volume);
+    // Fast conversion - single loop instead of triple
+    flat_to_cufft_complex(a, h_A);
+    flat_to_cufft_complex(b, h_B);
+  }
+
+  cufftComplex *d_A = nullptr, *d_B = nullptr;
+  int *d_real_part = nullptr;
+  cufftHandle plan;
+
+  {
+    CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_A), sizeof(cufftComplex) * init_volume));
+    CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_B), sizeof(cufftComplex) * init_volume));
+    CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_real_part), sizeof(int) * padded_volume));
+
+    CUDA_RT_CALL(cudaMemcpy(d_A, h_A, sizeof(cufftComplex) * init_volume, cudaMemcpyHostToDevice));
+    CUDA_RT_CALL(cudaMemcpy(d_B, h_B, sizeof(cufftComplex) * init_volume, cudaMemcpyHostToDevice));
+
+    pad_voxel_grid_cuda(d_A, a.dims(), padded_size);
+    pad_voxel_grid_cuda(d_B, b.dims(), padded_size);
+
+    CUFFT_CALL(cufftCreate(&plan));
+    CUFFT_CALL(cufftPlan3d(&plan, nx, ny, nz, CUFFT_C2C));
+
+    CUFFT_CALL(cufftExecC2C(plan, d_A, d_A, CUFFT_FORWARD));
+    CUFFT_CALL(cufftExecC2C(plan, d_B, d_B, CUFFT_FORWARD));
+
+    LL blockSize = 256;
+    LL numBlocks = (padded_volume + blockSize - 1) / blockSize;
+
+    element_wise_cmplx_mul<<<numBlocks, blockSize>>>(d_A, d_B, d_A, padded_volume);
+
+    CUFFT_CALL(cufftExecC2C(plan, d_A, d_A, CUFFT_INVERSE));
+
+    double scalar = 1.0 / ((double) padded_volume);
+    element_wise_cmplx_scalar_mul<<<numBlocks, blockSize>>>(d_A, scalar, padded_volume);
+    element_wise_round<<<numBlocks, blockSize>>>(d_A, padded_volume);
+    extract_real_kernel<<<numBlocks, blockSize>>>(d_A, d_real_part, padded_volume);
+
+    cudaMemcpy(h_out, d_real_part, sizeof(int) * padded_volume, cudaMemcpyDeviceToHost);
+  }
+
+  {
+    // Fast conversion - memcpy instead of triple loop
+    to_flat_grid(h_out, result, padded_size);
+    // Truncate to original size (only keep the valid portion)
+    // For flat grid, we need to copy row by row
+    FlatVoxelGrid truncated(N, M, L);
+    for (int i = 0; i < N; i++) {
+      for (int j = 0; j < M; j++) {
+        // Copy one row at a time
+        std::memcpy(&truncated(i, j, 0), &result(i, j, 0), L * sizeof(int));
+      }
+    }
+    result = std::move(truncated);
+  }
+
+  CUDA_RT_CALL(cudaFree(d_A));
+  CUDA_RT_CALL(cudaFree(d_B));
+  CUDA_RT_CALL(cudaFree(d_real_part));
+  CUFFT_CALL(cufftDestroy(plan));
+  free(h_A);
+  free(h_B);
+  free(h_out);
+}
+
+// Fast cross-correlation using FlatVoxelGrid
+void dft_corr3_flat(const FlatVoxelGrid &a, const FlatVoxelGrid &b, FlatVoxelGrid &result) {
+  FlatVoxelGrid flipped_a = a;
+  flip3d_flat(flipped_a);
+  dft_conv3_flat(flipped_a, b, result);
+  flip3d_flat(result);
 }
 
 void fft3d (fftw_complex *in, fftw_complex *out, Index3 size, bool inverse) {

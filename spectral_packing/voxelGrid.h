@@ -46,8 +46,20 @@ Index3 argmax3d(VoxelGrid &in);
 
 void get_voxel_grid_bounds(const VoxelGrid &g, Index3 &lo, Index3 &hi); 
 
-void make_voxel_grid_tight (VoxelGrid &vg); 
+void make_voxel_grid_tight (VoxelGrid &vg);
 
-void calculate_distance (const VoxelGrid &s_omega, VoxelGrid &distance_grid); 
+void calculate_distance (const VoxelGrid &s_omega, VoxelGrid &distance_grid);
+
+// Conversion functions between VoxelGrid and FlatVoxelGrid
+void voxel_grid_to_flat(const VoxelGrid &src, FlatVoxelGrid &dst);
+void flat_to_voxel_grid(const FlatVoxelGrid &src, VoxelGrid &dst);
+FlatVoxelGrid to_flat(const VoxelGrid &src);
+VoxelGrid to_nested(const FlatVoxelGrid &src);
+
+// FlatVoxelGrid operations (fast versions for GPU pipeline)
+void flip3d_flat(FlatVoxelGrid &a);
+void padto3d_flat(FlatVoxelGrid &a, Index3 padto, int value=0);
+void get_voxel_grid_bounds_flat(const FlatVoxelGrid &g, Index3 &lo, Index3 &hi);
+void where3d_flat(const FlatVoxelGrid &grid, vector<Index3> &idx, int value);
 
 #endif

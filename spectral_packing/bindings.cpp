@@ -99,6 +99,43 @@ py::array_t<int> voxel_grid_to_numpy(const VoxelGrid& grid) {
     return arr;
 }
 
+/**
+ * Convert a 3D NumPy array directly to a FlatVoxelGrid (single memcpy)
+ */
+FlatVoxelGrid numpy_to_flat_grid(py::array_t<int, py::array::c_style | py::array::forcecast> arr) {
+    py::buffer_info buf = arr.request();
+
+    if (buf.ndim != 3) {
+        throw std::runtime_error("Input array must be 3-dimensional, got " +
+                                 std::to_string(buf.ndim) + "D");
+    }
+
+    int nx = static_cast<int>(buf.shape[0]);
+    int ny = static_cast<int>(buf.shape[1]);
+    int nz = static_cast<int>(buf.shape[2]);
+
+    FlatVoxelGrid grid(nx, ny, nz);
+
+    // Single memcpy instead of triple loop - numpy is already row-major
+    int* ptr = static_cast<int*>(buf.ptr);
+    std::memcpy(grid.ptr(), ptr, grid.size_bytes());
+
+    return grid;
+}
+
+/**
+ * Convert a FlatVoxelGrid to a 3D NumPy array (single memcpy)
+ */
+py::array_t<int> flat_grid_to_numpy(const FlatVoxelGrid& grid) {
+    py::array_t<int> arr({grid.nx, grid.ny, grid.nz});
+    auto buf = arr.request();
+
+    // Single memcpy - both are row-major contiguous
+    std::memcpy(buf.ptr, grid.ptr(), grid.size_bytes());
+
+    return arr;
+}
+
 // ============================================================================
 // Python Wrapper Functions
 // ============================================================================

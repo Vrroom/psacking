@@ -25,6 +25,8 @@ using namespace std;
 
 void fft3d(fftw_complex *in, fftw_complex *out, Index3 size, bool inverse=false);
 void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result);
+void dft_conv3_flat(const FlatVoxelGrid &a, const FlatVoxelGrid &b, FlatVoxelGrid &result);
+void dft_corr3_flat(const FlatVoxelGrid &a, const FlatVoxelGrid &b, FlatVoxelGrid &result);
 void calculate_distance (const VoxelGrid &occ, VoxelGrid &dist);
 
 // --------------------------------------------------------------
@@ -241,12 +243,31 @@ void collision_grid (const VoxelGrid &tray, const VoxelGrid &item, VoxelGrid &co
   Index3 size = get_size(tray);
   auto [N, M, L] = size;
   Index3 lo, hi;
-  get_voxel_grid_bounds(item, lo, hi); 
-  auto [Mx, My, Mz] = hi; 
-  dft_corr3(tray, item, corr); 
-  FOR_VOXEL (i, j, k, size) 
+  get_voxel_grid_bounds(item, lo, hi);
+  auto [Mx, My, Mz] = hi;
+  dft_corr3(tray, item, corr);
+  FOR_VOXEL (i, j, k, size)
     if (!((i + Mx <= N - 1) && (j + My <= M - 1) && (k + Mz <= L - 1)))
-      corr[i][j][k] = max(corr[i][j][k], 1); 
+      corr[i][j][k] = max(corr[i][j][k], 1);
+}
+
+// Fast version using FlatVoxelGrid
+void collision_grid_flat(const FlatVoxelGrid &tray, const FlatVoxelGrid &item, FlatVoxelGrid &corr) {
+  int N = tray.nx, M = tray.ny, L = tray.nz;
+  Index3 lo, hi;
+  get_voxel_grid_bounds_flat(item, lo, hi);
+  auto [Mx, My, Mz] = hi;
+  dft_corr3_flat(tray, item, corr);
+
+  // Mark out-of-bounds positions as colliding
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < M; j++) {
+      for (int k = 0; k < L; k++) {
+        if (!((i + Mx <= N - 1) && (j + My <= M - 1) && (k + Mz <= L - 1)))
+          corr(i, j, k) = max(corr(i, j, k), 1);
+      }
+    }
+  }
 }
 
 // -------------------------------------------------------------- 
@@ -568,50 +589,53 @@ void voxelize (TriangleMesh_Ptr &mesh, VoxelGrid &vg, int voxel_resolution=VOXEL
   array3d_to_binary_voxel_grid(voxs, vg); 
 }
 
-Index3 fft_search_placement (const VoxelGrid &A, const VoxelGrid &tray, bool &found, double &score) { 
-  VoxelGrid padded_a = A;
+Index3 fft_search_placement (const VoxelGrid &A, const VoxelGrid &tray, bool &found, double &score) {
   Index3 tray_size = get_size(tray);
-  padto3d(padded_a, tray_size); 
+  int L = get<2>(tray_size);
 
-  VoxelGrid collision_metric; 
+  // Convert to flat arrays once at the start
+  FlatVoxelGrid padded_a_flat = to_flat(A);
+  FlatVoxelGrid tray_flat = to_flat(tray);
+  padto3d_flat(padded_a_flat, tray_size);
+
+  FlatVoxelGrid collision_metric;
   {
-    Timer tm("(fft_search_placement): collision grid"); 
-    collision_grid(tray, padded_a, collision_metric); 
+    Timer tm("(fft_search_placement): collision grid [flat]");
+    collision_grid_flat(tray_flat, padded_a_flat, collision_metric);
   }
 
-  VoxelGrid tray_phi; 
+  // Distance field still uses nested VoxelGrid (GPU kernel expects it)
+  VoxelGrid tray_phi;
+  FlatVoxelGrid tray_phi_flat;
   {
-    Timer tm("(fft_search_placement): distance"); 
-    calculate_distance(tray, tray_phi); 
+    Timer tm("(fft_search_placement): distance");
+    calculate_distance(tray, tray_phi);
+    tray_phi_flat = to_flat(tray_phi);
   }
 
-  VoxelGridFP promixity_metric_with_height_penalty;
-  VoxelGrid promixity_metric; 
+  FlatVoxelGrid proximity_metric;
   {
-    Timer tm("(fft_search_placement): proximity metric");
-    dft_corr3(tray_phi, padded_a, promixity_metric); 
-    resize3dfp(promixity_metric_with_height_penalty, tray_size, 0.0); 
-    FOR_VOXEL(i, j, k, tray_size) {
-      double qz = (k + 0.0) / (get<2>(tray_size) + 0.0); 
-      promixity_metric_with_height_penalty[i][j][k] = promixity_metric[i][j][k] + P * pow(qz, 3.0); 
-    }
+    Timer tm("(fft_search_placement): proximity metric [flat]");
+    dft_corr3_flat(tray_phi_flat, padded_a_flat, proximity_metric);
   }
 
-  Index3 bestId(-1, -1, -1); 
+  Index3 bestId(-1, -1, -1);
   found = false;
   {
-    Timer tm("(fft_search_placement): optimal placement search"); 
-    vector<Index3> non_colliding_loc; 
-    where3d(collision_metric, non_colliding_loc, 0); 
+    Timer tm("(fft_search_placement): optimal placement search");
+    vector<Index3> non_colliding_loc;
+    where3d_flat(collision_metric, non_colliding_loc, 0);
 
-    double bestVal = INF; 
+    double bestVal = INF;
     for (auto id : non_colliding_loc) {
       auto [i, j, k] = id;
-      if (promixity_metric_with_height_penalty[i][j][k] < bestVal) { 
+      double qz = (k + 0.0) / (L + 0.0);
+      double metric_with_penalty = proximity_metric(i, j, k) + P * pow(qz, 3.0);
+      if (metric_with_penalty < bestVal) {
         found = true;
-        bestId = id; 
-        bestVal = promixity_metric_with_height_penalty[i][j][k];
-        score = promixity_metric_with_height_penalty[i][j][k]; 
+        bestId = id;
+        bestVal = metric_with_penalty;
+        score = metric_with_penalty;
       }
     }
   }
@@ -633,28 +657,28 @@ Index3 fft_search_placement (const VoxelGrid &A, const VoxelGrid &tray, bool &fo
  */
 Index3 fft_search_placement_with_cache(const VoxelGrid &A, const VoxelGrid &tray,
                                         const VoxelGrid &tray_phi, bool &found, double &score) {
-  VoxelGrid padded_a = A;
   Index3 tray_size = get_size(tray);
-  padto3d(padded_a, tray_size);
+  int N = get<0>(tray_size), M = get<1>(tray_size), L = get<2>(tray_size);
 
-  VoxelGrid collision_metric;
+  // Convert to flat arrays once at the start (avoid triple-loop later)
+  FlatVoxelGrid padded_a_flat = to_flat(A);
+  FlatVoxelGrid tray_flat = to_flat(tray);
+  FlatVoxelGrid tray_phi_flat = to_flat(tray_phi);
+
+  padto3d_flat(padded_a_flat, tray_size);
+
+  FlatVoxelGrid collision_metric;
   {
-    Timer tm("(fft_search_placement_with_cache): collision grid");
-    collision_grid(tray, padded_a, collision_metric);
+    Timer tm("(fft_search_placement_with_cache): collision grid [flat]");
+    collision_grid_flat(tray_flat, padded_a_flat, collision_metric);
   }
 
   // Note: tray_phi is passed in pre-computed, skipping calculate_distance call
 
-  VoxelGridFP promixity_metric_with_height_penalty;
-  VoxelGrid promixity_metric;
+  FlatVoxelGrid proximity_metric;
   {
-    Timer tm("(fft_search_placement_with_cache): proximity metric");
-    dft_corr3(tray_phi, padded_a, promixity_metric);
-    resize3dfp(promixity_metric_with_height_penalty, tray_size, 0.0);
-    FOR_VOXEL(i, j, k, tray_size) {
-      double qz = (k + 0.0) / (get<2>(tray_size) + 0.0);
-      promixity_metric_with_height_penalty[i][j][k] = promixity_metric[i][j][k] + P * pow(qz, 3.0);
-    }
+    Timer tm("(fft_search_placement_with_cache): proximity metric [flat]");
+    dft_corr3_flat(tray_phi_flat, padded_a_flat, proximity_metric);
   }
 
   Index3 bestId(-1, -1, -1);
@@ -662,16 +686,18 @@ Index3 fft_search_placement_with_cache(const VoxelGrid &A, const VoxelGrid &tray
   {
     Timer tm("(fft_search_placement_with_cache): optimal placement search");
     vector<Index3> non_colliding_loc;
-    where3d(collision_metric, non_colliding_loc, 0);
+    where3d_flat(collision_metric, non_colliding_loc, 0);
 
     double bestVal = INF;
     for (auto id : non_colliding_loc) {
       auto [i, j, k] = id;
-      if (promixity_metric_with_height_penalty[i][j][k] < bestVal) {
+      double qz = (k + 0.0) / (L + 0.0);
+      double metric_with_penalty = proximity_metric(i, j, k) + P * pow(qz, 3.0);
+      if (metric_with_penalty < bestVal) {
         found = true;
         bestId = id;
-        bestVal = promixity_metric_with_height_penalty[i][j][k];
-        score = promixity_metric_with_height_penalty[i][j][k];
+        bestVal = metric_with_penalty;
+        score = metric_with_penalty;
       }
     }
   }
