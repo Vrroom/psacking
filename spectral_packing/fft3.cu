@@ -368,19 +368,19 @@ void calculate_distance (const VoxelGrid &occ, VoxelGrid &dist) {
     LL blockSize = 256;
     LL numBlocks; 
 
-    numBlocks = (N * L * M + blockSize - 1) / blockSize;
-    init_distance_grid<<<numBlocks, blockSize>>>(d_occ, N, L, M); 
+    numBlocks = (N * M * L + blockSize - 1) / blockSize;
+    init_distance_grid<<<numBlocks, blockSize>>>(d_occ, N, M, L);
 
     //for (int i = 0; i < N + L + M + 1; i++) {
     for (int i = 0; i < 8; i++) {
-      numBlocks = (L * M + blockSize - 1) / blockSize;
-      sweep_x<<<numBlocks, blockSize>>>(d_occ, N, L, M); 
-
-      numBlocks = (N * M + blockSize - 1) / blockSize;
-      sweep_y<<<numBlocks, blockSize>>>(d_occ, N, L, M); 
+      numBlocks = (M * L + blockSize - 1) / blockSize;
+      sweep_x<<<numBlocks, blockSize>>>(d_occ, N, M, L);
 
       numBlocks = (N * L + blockSize - 1) / blockSize;
-      sweep_z<<<numBlocks, blockSize>>>(d_occ, N, L, M); 
+      sweep_y<<<numBlocks, blockSize>>>(d_occ, N, M, L);
+
+      numBlocks = (N * M + blockSize - 1) / blockSize;
+      sweep_z<<<numBlocks, blockSize>>>(d_occ, N, M, L);
     }
     cudaMemcpy(h_occ, d_occ, sizeof(int) * init_volume, cudaMemcpyDeviceToHost);
   }
