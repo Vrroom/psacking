@@ -1,0 +1,137 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.5.0",
+    "pybind11>=2.11.0",
+    "cmake>=3.18",
+    "ninja",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "spectral-packer"
+version = "0.1.0"
+description = "GPU-accelerated 3D bin packing using FFT-based collision detection"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Spectral Packing Authors"}
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+keywords = [
+    "3d-packing",
+    "bin-packing",
+    "voxelization",
+    "fft",
+    "cuda",
+    "gpu",
+    "spectral-methods",
+]
+dependencies = [
+    "numpy>=1.20.0",
+    "trimesh>=3.21.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "isort>=5.12",
+    "mypy>=1.0",
+    "ruff>=0.1.0",
+]
+docs = [
+    "sphinx>=5.0",
+    "sphinx-rtd-theme>=1.0",
+    "sphinx-autodoc-typehints>=1.20",
+]
+visualization = [
+    "matplotlib>=3.5",
+    "plotly>=5.0",
+    "pyvista>=0.40",
+]
+all = [
+    "spectral-packer[dev,docs,visualization]",
+]
+
+[project.urls]
+Homepage = "https://github.com/spectral-packer/spectral-packer"
+Documentation = "https://spectral-packer.readthedocs.io"
+Repository = "https://github.com/spectral-packer/spectral-packer"
+Issues = "https://github.com/spectral-packer/spectral-packer/issues"
+
+[tool.scikit-build]
+cmake.minimum-version = "3.18"
+cmake.build-type = "Release"
+ninja.make-fallback = true
+wheel.packages = ["spectral_packer"]
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+BUILD_PYTHON_BINDINGS = "ON"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["spectral_packer"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by black)
+    "B008",  # function calls in argument defaults
+]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
