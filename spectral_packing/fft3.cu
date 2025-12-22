@@ -55,9 +55,9 @@ __global__
 void scaling_kernel(cufftComplex* data, int element_count, float scale) {
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
   const int stride = blockDim.x * gridDim.x;
-  for (auto i = tid; i<element_count; i+= stride) {
-    data[tid].x *= scale;
-    data[tid].y *= scale;
+  for (auto i = tid; i < element_count; i += stride) {
+    data[i].x *= scale;
+    data[i].y *= scale;
   }
 }
 
@@ -175,14 +175,13 @@ void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
   LL init_volume = vol(get_size(a));
   cufftComplex *h_A, *h_B; // , *h_out_A; 
   int *h_out; 
-  { 
-    Timer tm("(dft_conv3): Copying as is to cufftComplex"); 
-    h_A = (cufftComplex *) malloc (sizeof(cufftComplex) * init_volume); 
-    h_B = (cufftComplex *) malloc (sizeof(cufftComplex) * init_volume); 
-    // h_out_A = (cufftComplex *) malloc (sizeof(cufftComplex) * padded_volume); 
-    h_out = (int *) malloc (sizeof(int) * padded_volume); 
-    to_cufft_complex(a, h_A, get_size(a)); 
-    to_cufft_complex(b, h_B, get_size(a)); 
+  {
+    Timer tm("(dft_conv3): Copying as is to cufftComplex");
+    h_A = (cufftComplex *) malloc(sizeof(cufftComplex) * init_volume);
+    h_B = (cufftComplex *) malloc(sizeof(cufftComplex) * init_volume);
+    h_out = (int *) malloc(sizeof(int) * padded_volume);
+    to_cufft_complex(a, h_A, get_size(a));
+    to_cufft_complex(b, h_B, get_size(a));
   }
 
   cufftComplex *d_A = nullptr, *d_B = nullptr; 
@@ -351,13 +350,13 @@ void calculate_distance (const VoxelGrid &occ, VoxelGrid &dist) {
 
   LL init_volume = vol(get_size(occ));
   int *h_occ;
-  { 
+  {
     Timer tm("(calculate_distance): Allocating stuff");
-    h_occ = (int *) malloc (sizeof(int) * init_volume); 
+    h_occ = (int *) malloc(sizeof(int) * init_volume);
     int cnt = 0;
     for (int i = 0; i < N; i++)
-      for (int j = 0; j < M; j++) 
-        for (int k = 0; k < L; k++) 
+      for (int j = 0; j < M; j++)
+        for (int k = 0; k < L; k++)
           h_occ[cnt++] = occ[i][j][k];
   }
 
