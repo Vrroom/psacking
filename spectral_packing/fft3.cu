@@ -286,15 +286,15 @@ void sweep_z (int * grid, int N, int L, int M) {
   if (tid < N * L) { 
     int j = tid % L; 
     int i = (tid - j) / L;
-    for (int k = 0; k + 1 < M; k++) {
+    for (int k = M - 2; k >= 0; k--) {
       int idx = (i * L + j) * M + k;
-      int idx_n = (i * L + j) * M + k + 1; 
-      grid[idx] = min(grid[idx], grid[idx_n] + 1); 
+      int idx_n = (i * L + j) * M + k + 1;
+      grid[idx] = min(grid[idx], grid[idx_n] + 1);
     }
-    for (int k = M - 1; k > 0; k--) {
+    for (int k = 1; k < M; k++) {
       int idx = (i * L + j) * M + k;
-      int idx_n = (i * L + j) * M + k - 1; 
-      grid[idx] = min(grid[idx], grid[idx_n] + 1); 
+      int idx_n = (i * L + j) * M + k - 1;
+      grid[idx] = min(grid[idx], grid[idx_n] + 1);
     }
   }
 }
@@ -305,12 +305,12 @@ void sweep_y (int * grid, int N, int L, int M) {
   if (tid < N * M) { 
     int k = tid % M; 
     int i = (tid - k) / M;
-    for (int j = 0; j + 1 < L; j++) {
+    for (int j = L - 2; j >= 0; j--) {
       int idx = (i * L + j) * M + k;
-      int idx_n = (i * L + (j + 1)) * M + k; 
-      grid[idx] = min(grid[idx], grid[idx_n] + 1); 
+      int idx_n = (i * L + (j + 1)) * M + k;
+      grid[idx] = min(grid[idx], grid[idx_n] + 1);
     }
-    for (int j = L - 1; j > 0; j--) {
+    for (int j = 1; j < L; j++) {
       int idx = (i * L + j) * M + k;
       int idx_n = (i * L + (j - 1)) * M + k;
       grid[idx] = min(grid[idx], grid[idx_n] + 1);
@@ -324,15 +324,15 @@ void sweep_x (int * grid, int N, int L, int M) {
   if (tid < L * M) { 
     int k = tid % M; 
     int j = (tid - k) / M;
-    for (int i = 0; i + 1 < N; i++) {
+    for (int i = N - 2; i >= 0; i--) {
       int idx = (i * L + j) * M + k;
-      int idx_n = ((i + 1) * L + j) * M + k; 
-      grid[idx] = min(grid[idx], grid[idx_n] + 1); 
+      int idx_n = ((i + 1) * L + j) * M + k;
+      grid[idx] = min(grid[idx], grid[idx_n] + 1);
     }
-    for (int i = N - 1; i > 0; i--) {
+    for (int i = 1; i < N; i++) {
       int idx = (i * L + j) * M + k;
-      int idx_n = ((i - 1) * L + j) * M + k; 
-      grid[idx] = min(grid[idx], grid[idx_n] + 1); 
+      int idx_n = ((i - 1) * L + j) * M + k;
+      grid[idx] = min(grid[idx], grid[idx_n] + 1);
     }
   }
 }
@@ -371,8 +371,8 @@ void calculate_distance (const VoxelGrid &occ, VoxelGrid &dist) {
     numBlocks = (N * M * L + blockSize - 1) / blockSize;
     init_distance_grid<<<numBlocks, blockSize>>>(d_occ, N, M, L);
 
-    //for (int i = 0; i < N + L + M + 1; i++) {
-    for (int i = 0; i < 8; i++) {
+    // One iteration is sufficient with correct sweep order
+    for (int i = 0; i < 1; i++) {
       numBlocks = (M * L + blockSize - 1) / blockSize;
       sweep_x<<<numBlocks, blockSize>>>(d_occ, N, M, L);
 
