@@ -173,8 +173,8 @@ void extractRealPart(const fftw_complex *fftwArray, VoxelGrid &target, Index3 si
 #if USE_PARALLEL_FFT3D == 0
 void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
   auto [N, M, L] = get_size(a);
-  if (!same_size(get_size(a), get_size(b))) 
-    raise_and_kill("Input grids must be of the same size for convolution");
+  if (!same_size(get_size(a), get_size(b)))
+    throw std::runtime_error("Input grids must be of the same size for convolution");
   Index3 paddedSize = make_tuple(2 * N + 1, 2 * M + 1, 2 * L + 1);
   VoxelGrid a_cpy = a, b_cpy = b; 
   {
@@ -616,7 +616,67 @@ Index3 fft_search_placement (const VoxelGrid &A, const VoxelGrid &tray, bool &fo
     }
   }
 
-  return bestId; 
+  return bestId;
+}
+
+/**
+ * Variant of fft_search_placement that uses a pre-computed distance field.
+ * This allows caching the distance field across multiple orientation attempts,
+ * since the distance field only depends on the tray (not the item orientation).
+ *
+ * @param A The item to place
+ * @param tray The current tray state
+ * @param tray_phi Pre-computed distance field of the tray (from calculate_distance)
+ * @param found Output: whether a valid placement was found
+ * @param score Output: the placement score (lower is better)
+ * @return The optimal placement position
+ */
+Index3 fft_search_placement_with_cache(const VoxelGrid &A, const VoxelGrid &tray,
+                                        const VoxelGrid &tray_phi, bool &found, double &score) {
+  VoxelGrid padded_a = A;
+  Index3 tray_size = get_size(tray);
+  padto3d(padded_a, tray_size);
+
+  VoxelGrid collision_metric;
+  {
+    Timer tm("(fft_search_placement_with_cache): collision grid");
+    collision_grid(tray, padded_a, collision_metric);
+  }
+
+  // Note: tray_phi is passed in pre-computed, skipping calculate_distance call
+
+  VoxelGridFP promixity_metric_with_height_penalty;
+  VoxelGrid promixity_metric;
+  {
+    Timer tm("(fft_search_placement_with_cache): proximity metric");
+    dft_corr3(tray_phi, padded_a, promixity_metric);
+    resize3dfp(promixity_metric_with_height_penalty, tray_size, 0.0);
+    FOR_VOXEL(i, j, k, tray_size) {
+      double qz = (k + 0.0) / (get<2>(tray_size) + 0.0);
+      promixity_metric_with_height_penalty[i][j][k] = promixity_metric[i][j][k] + P * pow(qz, 3.0);
+    }
+  }
+
+  Index3 bestId(-1, -1, -1);
+  found = false;
+  {
+    Timer tm("(fft_search_placement_with_cache): optimal placement search");
+    vector<Index3> non_colliding_loc;
+    where3d(collision_metric, non_colliding_loc, 0);
+
+    double bestVal = INF;
+    for (auto id : non_colliding_loc) {
+      auto [i, j, k] = id;
+      if (promixity_metric_with_height_penalty[i][j][k] < bestVal) {
+        found = true;
+        bestId = id;
+        bestVal = promixity_metric_with_height_penalty[i][j][k];
+        score = promixity_metric_with_height_penalty[i][j][k];
+      }
+    }
+  }
+
+  return bestId;
 }
 
 void saveVoxelGrid(const char *fname, const VoxelGrid& vg) {
@@ -631,8 +691,9 @@ void place_in_tray (const VoxelGrid &item, VoxelGrid &tray, Index3 st_id, int va
     if (i >= a && j >= b && k >=c) {
       if (is_in_range(Index3(i - a, j - b, k - c), get_size(item))) {
         if (tray[i][j][k] > 0 && item[i - a][j - b][k - c] > 0) {
-          cout << i << " " << j << " " << k << endl;
-          raise_and_kill("(place_in_tray): Item to be placed intersects with contents of tray"); 
+          throw std::runtime_error(
+            "(place_in_tray): Item to be placed intersects with contents of tray at position (" +
+            std::to_string(i) + ", " + std::to_string(j) + ", " + std::to_string(k) + ")");
         }
         if (tray[i][j][k] == 0 && item[i - a][j - b][k - c] > 0)
           tray[i][j][k] = val;

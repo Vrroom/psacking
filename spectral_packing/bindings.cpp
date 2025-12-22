@@ -22,6 +22,8 @@
 void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result);
 void dft_corr3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result);
 Index3 fft_search_placement(const VoxelGrid &A, const VoxelGrid &tray, bool &found, double &score);
+Index3 fft_search_placement_with_cache(const VoxelGrid &A, const VoxelGrid &tray,
+                                        const VoxelGrid &tray_phi, bool &found, double &score);
 void place_in_tray(const VoxelGrid &item, VoxelGrid &tray, Index3 st_id, int val);
 void collision_grid(const VoxelGrid &tray, const VoxelGrid &item, VoxelGrid &corr);
 
@@ -134,6 +136,46 @@ py::tuple py_fft_search_placement(py::array_t<int> item, py::array_t<int> tray) 
     double score = 0.0;
 
     Index3 position = fft_search_placement(item_grid, tray_grid, found, score);
+
+    auto [x, y, z] = position;
+    return py::make_tuple(py::make_tuple(x, y, z), found, score);
+}
+
+/**
+ * Find optimal placement using a pre-computed distance field.
+ *
+ * This variant allows caching the distance field across multiple orientation
+ * attempts, since the distance field only depends on the tray state (not the
+ * item orientation). This can provide significant speedups when testing many
+ * orientations of the same item.
+ *
+ * @param item 3D int32 array representing the item to place
+ * @param tray 3D int32 array representing current tray state
+ * @param tray_distance Pre-computed distance field from calculate_distance(tray)
+ * @return tuple of (position, found, score)
+ */
+py::tuple py_fft_search_placement_with_cache(
+    py::array_t<int> item,
+    py::array_t<int> tray,
+    py::array_t<int> tray_distance
+) {
+    VoxelGrid item_grid = numpy_to_voxel_grid(item);
+    VoxelGrid tray_grid = numpy_to_voxel_grid(tray);
+    VoxelGrid tray_phi = numpy_to_voxel_grid(tray_distance);
+
+    // Check if item is larger than tray
+    Index3 item_size = get_size(item_grid);
+    Index3 tray_size = get_size(tray_grid);
+    if (std::get<0>(item_size) > std::get<0>(tray_size) ||
+        std::get<1>(item_size) > std::get<1>(tray_size) ||
+        std::get<2>(item_size) > std::get<2>(tray_size)) {
+        return py::make_tuple(py::make_tuple(-1, -1, -1), false, 0.0);
+    }
+
+    bool found = false;
+    double score = 0.0;
+
+    Index3 position = fft_search_placement_with_cache(item_grid, tray_grid, tray_phi, found, score);
 
     auto [x, y, z] = position;
     return py::make_tuple(py::make_tuple(x, y, z), found, score);
@@ -255,6 +297,10 @@ py::array_t<int> py_collision_grid(py::array_t<int> tray, py::array_t<int> item)
     VoxelGrid item_grid = numpy_to_voxel_grid(item);
     VoxelGrid collision;
 
+    // Pad item to match tray size (same as fft_search_placement does internally)
+    Index3 tray_size = get_size(tray_grid);
+    padto3d(item_grid, tray_size);
+
     collision_grid(tray_grid, item_grid, collision);
 
     return voxel_grid_to_numpy(collision);
@@ -345,6 +391,33 @@ PYBIND11_MODULE(_core, m) {
                   3D int32 array representing the item (1=occupied, 0=empty)
               tray : numpy.ndarray
                   3D int32 array representing current tray state
+
+              Returns
+              -------
+              tuple
+                  (position, found, score) where:
+                  - position: (x, y, z) placement coordinates
+                  - found: bool, whether valid placement exists
+                  - score: float, placement quality (lower is better)
+          )pbdoc");
+
+    m.def("fft_search_placement_with_cache", &py_fft_search_placement_with_cache,
+          py::arg("item"), py::arg("tray"), py::arg("tray_distance"),
+          R"pbdoc(
+              Find optimal placement using a pre-computed distance field.
+
+              This variant skips the distance field computation, which can provide
+              significant speedups when testing multiple orientations of the same item.
+              The distance field only depends on the tray state, not the item.
+
+              Parameters
+              ----------
+              item : numpy.ndarray
+                  3D int32 array representing the item (1=occupied, 0=empty)
+              tray : numpy.ndarray
+                  3D int32 array representing current tray state
+              tray_distance : numpy.ndarray
+                  Pre-computed distance field from calculate_distance(tray)
 
               Returns
               -------

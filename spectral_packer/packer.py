@@ -291,7 +291,12 @@ class BinPacker:
                 "Make sure the package was built with CUDA support."
             )
 
-        from . import fft_search_placement, place_in_tray
+        from . import (
+            fft_search_placement,
+            fft_search_placement_with_cache,
+            place_in_tray,
+            calculate_distance,
+        )
 
         if len(items) == 0:
             raise ValueError("items list cannot be empty")
@@ -335,6 +340,11 @@ class BinPacker:
 
             orientations = get_orientations(item, self.num_orientations)
 
+            # Pre-compute distance field ONCE per item (not per orientation)
+            # This is the key optimization - distance only depends on tray state
+            if self.num_orientations > 1:
+                tray_distance = calculate_distance(tray)
+
             for orient_idx, rotated_item in enumerate(orientations):
                 # Make sure it's contiguous for C++ bindings
                 rotated_item = make_contiguous(rotated_item.astype(np.int32))
@@ -343,7 +353,13 @@ class BinPacker:
                 if any(rotated_item.shape[i] > self.tray_size[i] for i in range(3)):
                     continue
 
-                position, found, score = fft_search_placement(rotated_item, tray)
+                # Use cached version when testing multiple orientations
+                if self.num_orientations > 1:
+                    position, found, score = fft_search_placement_with_cache(
+                        rotated_item, tray, tray_distance
+                    )
+                else:
+                    position, found, score = fft_search_placement(rotated_item, tray)
 
                 if found and score < best_score:
                     best_position = position

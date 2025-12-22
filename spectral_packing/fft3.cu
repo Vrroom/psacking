@@ -1,12 +1,13 @@
 /**
  * Based on https://github.com/NVIDIA/CUDALibrarySamples/tree/master/cuFFT/3d_c2c
  */ 
-#include <array> 
+#include <array>
 #include <fftw3.h>
 #include <complex>
 #include <cuda_runtime.h>
 #include <cufft.h>
 #include <iostream>
+#include <stdexcept>
 #include <LibSL/LibSL.h>
 #include "indexOps.h"
 #include "constants.h"
@@ -164,8 +165,8 @@ void pad_voxel_grid_cuda (cufftComplex *&d_voxel_grid, Index3 orig_size, Index3 
 void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
   auto [N, M, L] = get_size(a);
 
-  if (!same_size(get_size(a), get_size(b))) 
-    raise_and_kill("Input grids must be of the same size for convolution");
+  if (!same_size(get_size(a), get_size(b)))
+    throw std::runtime_error("Input grids must be of the same size for convolution");
 
   Index3 padded_size = make_tuple(2 * N + 1, 2 * M + 1, 2 * L + 1);
   auto [nx, ny, nz] = padded_size;
@@ -234,8 +235,9 @@ void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
   CUDA_RT_CALL(cudaFree(d_B))
   CUDA_RT_CALL(cudaFree(d_real_part))
   CUFFT_CALL(cufftDestroy(plan));
-  CUDA_RT_CALL(cudaDeviceReset());
-  free(h_A); 
+  // Note: cudaDeviceReset() removed - it was resetting the entire CUDA context
+  // which is unnecessary and kills performance when called repeatedly
+  free(h_A);
   free(h_B);
   free(h_out);
 }
@@ -273,11 +275,11 @@ void fft3d (fftw_complex *in, fftw_complex *out, Index3 size, bool inverse) {
     CUDA_RT_CALL(cudaMemcpyAsync(data.data(), d_data, sizeof(Complex) * data.size(), cudaMemcpyDeviceToHost, stream));
     CUDA_RT_CALL(cudaStreamSynchronize(stream));
   }
-  copyFro(data, out, size); 
+  copyFro(data, out, size);
   CUDA_RT_CALL(cudaFree(d_data))
   CUFFT_CALL(cufftDestroy(plan));
   CUDA_RT_CALL(cudaStreamDestroy(stream));
-  CUDA_RT_CALL(cudaDeviceReset());
+  // Note: cudaDeviceReset() removed - unnecessary context reset
 } 
 
 __global__ 
@@ -396,8 +398,8 @@ void calculate_distance (const VoxelGrid &occ, VoxelGrid &dist) {
   }
 
   CUDA_RT_CALL(cudaFree(d_occ));
-  CUDA_RT_CALL(cudaDeviceReset());
-  free(h_occ); 
+  // Note: cudaDeviceReset() removed - unnecessary context reset
+  free(h_occ);
 }
 #endif
 
