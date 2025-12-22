@@ -84,8 +84,15 @@ from .mesh_io import (
     MeshValidationError,
     SUPPORTED_FORMATS,
 )
-from .packer import BinPacker, PackingResult
+from .packer import BinPacker, PackingResult, PlacementInfo
 from .voxelizer import Voxelizer
+from .rotations import (
+    get_orientations,
+    get_24_orientations,
+    rotate_90_x,
+    rotate_90_y,
+    rotate_90_z,
+)
 
 __all__ = [
     # Version info
@@ -93,7 +100,14 @@ __all__ = [
     # High-level API
     "BinPacker",
     "PackingResult",
+    "PlacementInfo",
     "Voxelizer",
+    # Rotation utilities
+    "get_orientations",
+    "get_24_orientations",
+    "rotate_90_x",
+    "rotate_90_y",
+    "rotate_90_z",
     # Mesh I/O
     "load_mesh",
     "get_mesh_info",

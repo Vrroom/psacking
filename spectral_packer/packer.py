@@ -23,6 +23,7 @@ import numpy as np
 
 from .mesh_io import load_mesh
 from .voxelizer import Voxelizer
+from .rotations import get_orientations, make_contiguous
 
 
 @dataclass
@@ -41,6 +42,8 @@ class PlacementInfo:
         Whether the item was successfully placed.
     volume : int
         Number of voxels in the item.
+    orientation_index : int
+        Index of the orientation used (0 = original orientation).
     """
 
     item_index: int
@@ -48,6 +51,7 @@ class PlacementInfo:
     score: Optional[float]
     success: bool
     volume: int = 0
+    orientation_index: int = 0
 
 
 @dataclass
@@ -148,6 +152,11 @@ class BinPacker:
     height_penalty : float, default 1e8
         Penalty factor for height in placement scoring.
         Higher values encourage items to be placed lower.
+    num_orientations : int, default 1
+        Number of orientations to try for each item.
+        Valid values: 1 (original only), 4 (Z-axis rotations),
+        6 (one per face), 24 (all cube symmetries).
+        More orientations = better packing but slower.
 
     Attributes
     ----------
@@ -157,6 +166,8 @@ class BinPacker:
         Voxelization resolution.
     height_penalty : float
         Height penalty factor.
+    num_orientations : int
+        Number of orientations to sample.
 
     Examples
     --------
@@ -184,6 +195,7 @@ class BinPacker:
         tray_size: Tuple[int, int, int],
         voxel_resolution: int = 128,
         height_penalty: float = 1e8,
+        num_orientations: int = 1,
     ):
         if len(tray_size) != 3:
             raise ValueError(f"tray_size must be a 3-tuple, got {len(tray_size)} elements")
@@ -191,10 +203,13 @@ class BinPacker:
             raise ValueError(f"tray_size dimensions must be positive, got {tray_size}")
         if voxel_resolution <= 0:
             raise ValueError(f"voxel_resolution must be positive, got {voxel_resolution}")
+        if num_orientations not in (1, 4, 6, 24):
+            raise ValueError(f"num_orientations must be 1, 4, 6, or 24, got {num_orientations}")
 
         self.tray_size = tuple(tray_size)
         self.voxel_resolution = voxel_resolution
         self.height_penalty = height_penalty
+        self.num_orientations = num_orientations
         self._voxelizer = Voxelizer(resolution=voxel_resolution)
 
     def pack_files(
@@ -311,20 +326,44 @@ class BinPacker:
         for idx, (item, orig_idx, volume) in enumerate(
             zip(processed_items, original_indices, volumes)
         ):
-            # Find placement
-            position, found, score = fft_search_placement(item, tray)
+            # Try multiple orientations and find the best placement
+            best_position = None
+            best_score = float('inf')
+            best_orientation_idx = 0
+            best_rotated_item = item
+            found_any = False
 
-            if found:
-                # Place item (item_id is 1-indexed)
+            orientations = get_orientations(item, self.num_orientations)
+
+            for orient_idx, rotated_item in enumerate(orientations):
+                # Make sure it's contiguous for C++ bindings
+                rotated_item = make_contiguous(rotated_item.astype(np.int32))
+
+                # Skip if rotated item doesn't fit in tray
+                if any(rotated_item.shape[i] > self.tray_size[i] for i in range(3)):
+                    continue
+
+                position, found, score = fft_search_placement(rotated_item, tray)
+
+                if found and score < best_score:
+                    best_position = position
+                    best_score = score
+                    best_orientation_idx = orient_idx
+                    best_rotated_item = rotated_item
+                    found_any = True
+
+            if found_any:
+                # Place item with best orientation (item_id is 1-indexed)
                 item_id = num_placed + 1
-                tray = place_in_tray(item, tray, position, item_id)
+                tray = place_in_tray(best_rotated_item, tray, best_position, item_id)
                 num_placed += 1
                 placements.append(PlacementInfo(
                     item_index=orig_idx,
-                    position=position,
-                    score=score,
+                    position=best_position,
+                    score=best_score,
                     success=True,
                     volume=volume,
+                    orientation_index=best_orientation_idx,
                 ))
             else:
                 placements.append(PlacementInfo(
@@ -333,6 +372,7 @@ class BinPacker:
                     score=None,
                     success=False,
                     volume=volume,
+                    orientation_index=0,
                 ))
 
         # Sort placements by original index for consistent ordering
@@ -415,5 +455,6 @@ class BinPacker:
     def __repr__(self) -> str:
         return (
             f"BinPacker(tray_size={self.tray_size}, "
-            f"voxel_resolution={self.voxel_resolution})"
+            f"voxel_resolution={self.voxel_resolution}, "
+            f"num_orientations={self.num_orientations})"
         )
