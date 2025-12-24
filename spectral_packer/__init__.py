@@ -55,6 +55,7 @@ try:
         HEIGHT_PENALTY,
         fft_search_placement,
         fft_search_placement_with_cache,
+        fft_search_batch,  # Phase 4: Batch orientation processing
         place_in_tray,
         voxelize_stl,
         dft_conv3,
@@ -125,6 +126,7 @@ __all__ = [
     # Core functions (if available)
     "fft_search_placement",
     "fft_search_placement_with_cache",
+    "fft_search_batch",  # Phase 4: Batch orientation processing
     "place_in_tray",
     "voxelize_stl",
     "dft_conv3",

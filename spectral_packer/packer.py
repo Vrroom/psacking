@@ -324,6 +324,7 @@ class BinPacker:
 
         # Initialize tray
         tray = np.zeros(self.tray_size, dtype=np.int32)
+        generation = 0
 
         placements = []
         num_placed = 0
@@ -341,22 +342,18 @@ class BinPacker:
             orientations = get_orientations(item, self.num_orientations)
 
             # Pre-compute distance field ONCE per item (not per orientation)
-            # This is the key optimization - distance only depends on tray state
             if self.num_orientations > 1:
                 tray_distance = calculate_distance(tray)
 
             for orient_idx, rotated_item in enumerate(orientations):
-                # Make sure it's contiguous for C++ bindings
                 rotated_item = make_contiguous(rotated_item.astype(np.int32))
 
-                # Skip if rotated item doesn't fit in tray
                 if any(rotated_item.shape[i] > self.tray_size[i] for i in range(3)):
                     continue
 
-                # Use cached version when testing multiple orientations
                 if self.num_orientations > 1:
                     position, found, score = fft_search_placement_with_cache(
-                        rotated_item, tray, tray_distance
+                        rotated_item, tray, tray_distance, generation
                     )
                 else:
                     position, found, score = fft_search_placement(rotated_item, tray)
@@ -369,9 +366,9 @@ class BinPacker:
                     found_any = True
 
             if found_any:
-                # Place item with best orientation (item_id is 1-indexed)
                 item_id = num_placed + 1
                 tray = place_in_tray(best_rotated_item, tray, best_position, item_id)
+                generation += 1
                 num_placed += 1
                 placements.append(PlacementInfo(
                     item_index=orig_idx,

@@ -37,6 +37,10 @@ void gpu_tray_context_cleanup();
 bool gpu_tray_context_is_initialized();
 Index3 fft_search_with_gpu_context(const FlatVoxelGrid& item, bool& found, double& score);
 
+// Phase 4: Batch orientation processing (from fft3.cu)
+void fft_search_batch(const std::vector<FlatVoxelGrid>& orientations,
+                      Index3& best_position, bool& found, double& best_score);
+
 // Forward declarations from LibSL (mesh loading)
 #include <LibSL/LibSL.h>
 void voxelize(TriangleMesh_Ptr &mesh, VoxelGrid &vg, int voxel_resolution);
@@ -188,41 +192,45 @@ py::tuple py_fft_search_placement(py::array_t<int> item, py::array_t<int> tray) 
     return py::make_tuple(py::make_tuple(x, y, z), found, score);
 }
 
+// ============================================================================
+// GPU Context Cache Management
+// ============================================================================
+
+static uint64_t g_cached_generation = 0;
+
 /**
  * Find optimal placement using a pre-computed distance field.
- *
- * This variant allows caching the distance field across multiple orientation
- * attempts, since the distance field only depends on the tray state (not the
- * item orientation). This can provide significant speedups when testing many
- * orientations of the same item.
  *
  * @param item 3D int32 array representing the item to place
  * @param tray 3D int32 array representing current tray state
  * @param tray_distance Pre-computed distance field from calculate_distance(tray)
+ * @param generation Tray version number (increment after each placement)
  * @return tuple of (position, found, score)
  */
 py::tuple py_fft_search_placement_with_cache(
     py::array_t<int> item,
     py::array_t<int> tray,
-    py::array_t<int> tray_distance
+    py::array_t<int> tray_distance,
+    uint64_t generation
 ) {
-    // Fast path: numpy → FlatVoxelGrid (single memcpy each)
     FlatVoxelGrid item_flat = numpy_to_flat_grid(item);
     FlatVoxelGrid tray_flat = numpy_to_flat_grid(tray);
     FlatVoxelGrid tray_phi_flat = numpy_to_flat_grid(tray_distance);
 
-    // Check if item is larger than tray
     if (item_flat.nx > tray_flat.nx ||
         item_flat.ny > tray_flat.ny ||
         item_flat.nz > tray_flat.nz) {
         return py::make_tuple(py::make_tuple(-1, -1, -1), false, 0.0);
     }
 
+    if (!gpu_tray_context_is_initialized() || generation != g_cached_generation) {
+        gpu_tray_context_init(tray_flat, tray_phi_flat);
+        g_cached_generation = generation;
+    }
+
     bool found = false;
     double score = 0.0;
-
-    Index3 position = fft_search_placement_with_cache_flat(
-        item_flat, tray_flat, tray_phi_flat, found, score);
+    Index3 position = fft_search_with_gpu_context(item_flat, found, score);
 
     auto [x, y, z] = position;
     return py::make_tuple(py::make_tuple(x, y, z), found, score);
@@ -444,6 +452,45 @@ py::tuple py_gpu_tray_search(py::array_t<int> item) {
     return py::make_tuple(py::make_tuple(x, y, z), found, score);
 }
 
+/**
+ * Phase 4: Batch search over multiple orientations in a single call.
+ *
+ * @param orientations List of 3D int32 arrays, one per orientation
+ * @param tray 3D int32 array representing current tray state
+ * @param tray_distance Pre-computed distance field
+ * @param generation Tray version number
+ * @return tuple of (position, found, score) for the best orientation
+ */
+py::tuple py_fft_search_batch(
+    py::list orientations,
+    py::array_t<int> tray,
+    py::array_t<int> tray_distance,
+    uint64_t generation
+) {
+    FlatVoxelGrid tray_flat = numpy_to_flat_grid(tray);
+    FlatVoxelGrid tray_phi_flat = numpy_to_flat_grid(tray_distance);
+
+    if (!gpu_tray_context_is_initialized() || generation != g_cached_generation) {
+        gpu_tray_context_init(tray_flat, tray_phi_flat);
+        g_cached_generation = generation;
+    }
+
+    std::vector<FlatVoxelGrid> orientation_grids;
+    orientation_grids.reserve(py::len(orientations));
+    for (auto item : orientations) {
+        auto arr = item.cast<py::array_t<int>>();
+        orientation_grids.push_back(numpy_to_flat_grid(arr));
+    }
+
+    Index3 best_position;
+    bool found = false;
+    double best_score = 0.0;
+    fft_search_batch(orientation_grids, best_position, found, best_score);
+
+    auto [x, y, z] = best_position;
+    return py::make_tuple(py::make_tuple(x, y, z), found, best_score);
+}
+
 // ============================================================================
 // Module Definition
 // ============================================================================
@@ -497,13 +544,9 @@ PYBIND11_MODULE(_core, m) {
           )pbdoc");
 
     m.def("fft_search_placement_with_cache", &py_fft_search_placement_with_cache,
-          py::arg("item"), py::arg("tray"), py::arg("tray_distance"),
+          py::arg("item"), py::arg("tray"), py::arg("tray_distance"), py::arg("generation"),
           R"pbdoc(
               Find optimal placement using a pre-computed distance field.
-
-              This variant skips the distance field computation, which can provide
-              significant speedups when testing multiple orientations of the same item.
-              The distance field only depends on the tray state, not the item.
 
               Parameters
               ----------
@@ -513,6 +556,8 @@ PYBIND11_MODULE(_core, m) {
                   3D int32 array representing current tray state
               tray_distance : numpy.ndarray
                   Pre-computed distance field from calculate_distance(tray)
+              generation : int
+                  Tray version number (increment after each placement)
 
               Returns
               -------
@@ -650,6 +695,28 @@ PYBIND11_MODULE(_core, m) {
               ------
               RuntimeError
                   If gpu_tray_init() was not called first
+          )pbdoc");
+
+    m.def("fft_search_batch", &py_fft_search_batch,
+          py::arg("orientations"), py::arg("tray"), py::arg("tray_distance"), py::arg("generation"),
+          R"pbdoc(
+              Batch search over multiple item orientations in a single call.
+
+              Parameters
+              ----------
+              orientations : list of numpy.ndarray
+                  List of 3D int32 arrays, one per orientation
+              tray : numpy.ndarray
+                  3D int32 array representing current tray state
+              tray_distance : numpy.ndarray
+                  Pre-computed distance field from calculate_distance(tray)
+              generation : int
+                  Tray version number (increment after each placement)
+
+              Returns
+              -------
+              tuple
+                  (position, found, score) for the best orientation
           )pbdoc");
 
     // Module-level constants

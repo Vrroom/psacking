@@ -14,6 +14,7 @@
 #include "types.h"
 #include "error.h"
 #include "voxelGrid.h"
+#include "timing.h"
 
 using namespace std;
 
@@ -90,11 +91,153 @@ void element_wise_round (cufftComplex *A, int n) {
   }
 }
 
-__global__ 
+__global__
 void extract_real_kernel(cufftComplex *A, int *B, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x; 
-  if (i < n) 
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n)
     B[i] = (int) A[i].x;
+}
+
+// =============================================================================
+// GPU-Resident Score Computation Kernels (Phase 2)
+// =============================================================================
+
+// Compute penalty-adjusted scores on GPU, marking invalid positions with INF
+__global__
+void compute_scores_kernel(const int* collision_metric, const int* proximity_metric,
+                           double* scores, int nx, int ny, int nz,
+                           int max_x, int max_y, int max_z,
+                           double height_penalty) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = nx * ny * nz;
+  if (tid < total) {
+    int k = tid % nz;
+    int j = (tid / nz) % ny;
+    int i = tid / (ny * nz);
+
+    // Check collision
+    if (collision_metric[tid] != 0) {
+      scores[tid] = 1e30;  // Invalid: collision
+      return;
+    }
+
+    // Check out-of-bounds
+    if (!((i + max_x <= nx - 1) && (j + max_y <= ny - 1) && (k + max_z <= nz - 1))) {
+      scores[tid] = 1e30;  // Invalid: OOB
+      return;
+    }
+
+    // Compute penalty-adjusted score
+    double qz = (double)k / (double)nz;
+    scores[tid] = (double)proximity_metric[tid] + height_penalty * qz * qz * qz;
+  }
+}
+
+// =============================================================================
+// Phase 3: Fused Int→Float Conversion Kernels
+// =============================================================================
+
+// Convert int array to cufftComplex on GPU (fused with padding)
+// This reduces H2D bandwidth by 50% (4 bytes/int vs 8 bytes/float2)
+__global__
+void int_to_complex_and_pad_kernel(const int* src, cufftComplex* dst,
+                                    int src_nx, int src_ny, int src_nz,
+                                    int dst_nx, int dst_ny, int dst_nz) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int src_total = src_nx * src_ny * src_nz;
+  int dst_total = dst_nx * dst_ny * dst_nz;
+
+  // Initialize all destination elements to zero first
+  // (This kernel will be called once to set zeros, then source will be copied)
+  if (tid < dst_total) {
+    dst[tid].x = 0.0f;
+    dst[tid].y = 0.0f;
+  }
+}
+
+// Copy and convert source ints to complex in padded destination
+__global__
+void int_to_complex_copy_kernel(const int* src, cufftComplex* dst,
+                                 int src_nx, int src_ny, int src_nz,
+                                 int dst_ny, int dst_nz) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int src_total = src_nx * src_ny * src_nz;
+
+  if (tid < src_total) {
+    // Convert linear index to 3D coordinates
+    int k = tid % src_nz;
+    int j = (tid / src_nz) % src_ny;
+    int i = tid / (src_ny * src_nz);
+
+    // Compute destination index (in padded array)
+    int dst_idx = (i * dst_ny + j) * dst_nz + k;
+
+    // Convert int to complex
+    dst[dst_idx].x = (float)src[tid];
+    dst[dst_idx].y = 0.0f;
+  }
+}
+
+// Truncate and flip a padded result into tray-sized output (GPU version)
+__global__
+void truncate_flip_kernel(const int* padded, int* output,
+                          int nx, int ny, int nz,
+                          int px, int py, int pz) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = nx * ny * nz;
+  if (tid < total) {
+    int k = tid % nz;
+    int j = (tid / nz) % ny;
+    int i = tid / (ny * nz);
+
+    // Flip coordinates
+    int fi = nx - 1 - i;
+    int fj = ny - 1 - j;
+    int fk = nz - 1 - k;
+
+    // Read from padded (using padded dimensions for indexing)
+    int src_idx = (fi * py + fj) * pz + fk;
+    output[tid] = padded[src_idx];
+  }
+}
+
+// Parallel reduction to find argmin - each block finds its local minimum
+__global__
+void argmin_reduction_kernel(const double* scores, int n,
+                             int* block_argmin, double* block_min) {
+  extern __shared__ char shared_mem[];
+  double* s_scores = (double*)shared_mem;
+  int* s_indices = (int*)(shared_mem + blockDim.x * sizeof(double));
+
+  int tid = threadIdx.x;
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // Load data into shared memory
+  if (gid < n) {
+    s_scores[tid] = scores[gid];
+    s_indices[tid] = gid;
+  } else {
+    s_scores[tid] = 1e30;
+    s_indices[tid] = -1;
+  }
+  __syncthreads();
+
+  // Reduction within block
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s && tid + s < blockDim.x) {
+      if (s_scores[tid + s] < s_scores[tid]) {
+        s_scores[tid] = s_scores[tid + s];
+        s_indices[tid] = s_indices[tid + s];
+      }
+    }
+    __syncthreads();
+  }
+
+  // First thread writes block result
+  if (tid == 0) {
+    block_min[blockIdx.x] = s_scores[0];
+    block_argmin[blockIdx.x] = s_indices[0];
+  }
 }
 
 __global__ 
@@ -256,6 +399,8 @@ void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
 
 // Fast version using FlatVoxelGrid - avoids triple-loop conversions
 void dft_conv3_flat(const FlatVoxelGrid &a, const FlatVoxelGrid &b, FlatVoxelGrid &result) {
+  SCOPED_TIMER("dft_conv3_flat_total");
+
   int N = a.nx, M = a.ny, L = a.nz;
 
   if (a.nx != b.nx || a.ny != b.ny || a.nz != b.nz)
@@ -269,6 +414,7 @@ void dft_conv3_flat(const FlatVoxelGrid &a, const FlatVoxelGrid &b, FlatVoxelGri
   cufftComplex *h_A, *h_B;
   int *h_out;
   {
+    SCOPED_TIMER("to_cufft_complex");
     h_A = (cufftComplex *) malloc(sizeof(cufftComplex) * init_volume);
     h_B = (cufftComplex *) malloc(sizeof(cufftComplex) * init_volume);
     h_out = (int *) malloc(sizeof(int) * padded_volume);
@@ -282,38 +428,68 @@ void dft_conv3_flat(const FlatVoxelGrid &a, const FlatVoxelGrid &b, FlatVoxelGri
   cufftHandle plan;
 
   {
+    SCOPED_TIMER("cuda_malloc");
     CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_A), sizeof(cufftComplex) * init_volume));
     CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_B), sizeof(cufftComplex) * init_volume));
     CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_real_part), sizeof(int) * padded_volume));
+  }
 
+  {
+    SCOPED_TIMER("memcpy_H2D");
     CUDA_RT_CALL(cudaMemcpy(d_A, h_A, sizeof(cufftComplex) * init_volume, cudaMemcpyHostToDevice));
     CUDA_RT_CALL(cudaMemcpy(d_B, h_B, sizeof(cufftComplex) * init_volume, cudaMemcpyHostToDevice));
+  }
 
+  {
+    SCOPED_TIMER("pad_voxel_grid");
     pad_voxel_grid_cuda(d_A, a.dims(), padded_size);
     pad_voxel_grid_cuda(d_B, b.dims(), padded_size);
+  }
 
+  {
+    SCOPED_TIMER("cufft_plan_create");
     CUFFT_CALL(cufftCreate(&plan));
     CUFFT_CALL(cufftPlan3d(&plan, nx, ny, nz, CUFFT_C2C));
+  }
 
+  {
+    SCOPED_TIMER("cufft_forward");
     CUFFT_CALL(cufftExecC2C(plan, d_A, d_A, CUFFT_FORWARD));
     CUFFT_CALL(cufftExecC2C(plan, d_B, d_B, CUFFT_FORWARD));
+    cudaDeviceSynchronize();  // Required for accurate timing
+  }
 
-    LL blockSize = 256;
-    LL numBlocks = (padded_volume + blockSize - 1) / blockSize;
+  LL blockSize = 256;
+  LL numBlocks = (padded_volume + blockSize - 1) / blockSize;
 
+  {
+    SCOPED_TIMER("cmplx_mul");
     element_wise_cmplx_mul<<<numBlocks, blockSize>>>(d_A, d_B, d_A, padded_volume);
+    cudaDeviceSynchronize();
+  }
 
+  {
+    SCOPED_TIMER("cufft_inverse");
     CUFFT_CALL(cufftExecC2C(plan, d_A, d_A, CUFFT_INVERSE));
+    cudaDeviceSynchronize();
+  }
 
+  {
+    SCOPED_TIMER("post_process_kernels");
     double scalar = 1.0 / ((double) padded_volume);
     element_wise_cmplx_scalar_mul<<<numBlocks, blockSize>>>(d_A, scalar, padded_volume);
     element_wise_round<<<numBlocks, blockSize>>>(d_A, padded_volume);
     extract_real_kernel<<<numBlocks, blockSize>>>(d_A, d_real_part, padded_volume);
+    cudaDeviceSynchronize();
+  }
 
+  {
+    SCOPED_TIMER("memcpy_D2H");
     cudaMemcpy(h_out, d_real_part, sizeof(int) * padded_volume, cudaMemcpyDeviceToHost);
   }
 
   {
+    SCOPED_TIMER("to_flat_grid");
     // Fast conversion - memcpy instead of triple loop
     to_flat_grid(h_out, result, padded_size);
     // Truncate to original size (only keep the valid portion)
@@ -339,10 +515,17 @@ void dft_conv3_flat(const FlatVoxelGrid &a, const FlatVoxelGrid &b, FlatVoxelGri
 
 // Fast cross-correlation using FlatVoxelGrid
 void dft_corr3_flat(const FlatVoxelGrid &a, const FlatVoxelGrid &b, FlatVoxelGrid &result) {
+  SCOPED_TIMER("dft_corr3_flat_total");
   FlatVoxelGrid flipped_a = a;
-  flip3d_flat(flipped_a);
+  {
+    SCOPED_TIMER("flip3d_input");
+    flip3d_flat(flipped_a);
+  }
   dft_conv3_flat(flipped_a, b, result);
-  flip3d_flat(result);
+  {
+    SCOPED_TIMER("flip3d_output");
+    flip3d_flat(result);
+  }
 }
 
 void fft3d (fftw_complex *in, fftw_complex *out, Index3 size, bool inverse) {
@@ -557,6 +740,17 @@ public:
   cufftComplex* d_item;
   int* d_real_part;
 
+  // Phase 2: GPU-resident score computation buffers
+  int* d_collision_result;     // Collision metric (stays on GPU)
+  int* d_proximity_result;     // Proximity metric (stays on GPU)
+  double* d_scores;            // Score buffer for argmin
+  int* d_block_argmin;         // Block-level argmin results
+  double* d_block_min;         // Block-level min values
+  cufftComplex* d_item2;       // Second item buffer for parallel correlation
+
+  // Phase 3: Raw int buffer for fused conversion (half H2D bandwidth)
+  int* d_item_int;             // Raw int buffer for item upload
+
   // cuFFT plan (reusable)
   cufftHandle plan;
 
@@ -564,6 +758,9 @@ public:
 
   GPUTrayContext() : d_tray_fft(nullptr), d_tray_phi_fft(nullptr),
                      d_item(nullptr), d_real_part(nullptr),
+                     d_collision_result(nullptr), d_proximity_result(nullptr),
+                     d_scores(nullptr), d_block_argmin(nullptr), d_block_min(nullptr),
+                     d_item2(nullptr), d_item_int(nullptr),
                      initialized(false) {}
 
   ~GPUTrayContext() {
@@ -575,6 +772,13 @@ public:
     if (d_tray_phi_fft) { cudaFree(d_tray_phi_fft); d_tray_phi_fft = nullptr; }
     if (d_item) { cudaFree(d_item); d_item = nullptr; }
     if (d_real_part) { cudaFree(d_real_part); d_real_part = nullptr; }
+    if (d_collision_result) { cudaFree(d_collision_result); d_collision_result = nullptr; }
+    if (d_proximity_result) { cudaFree(d_proximity_result); d_proximity_result = nullptr; }
+    if (d_scores) { cudaFree(d_scores); d_scores = nullptr; }
+    if (d_block_argmin) { cudaFree(d_block_argmin); d_block_argmin = nullptr; }
+    if (d_block_min) { cudaFree(d_block_min); d_block_min = nullptr; }
+    if (d_item2) { cudaFree(d_item2); d_item2 = nullptr; }
+    if (d_item_int) { cudaFree(d_item_int); d_item_int = nullptr; }
     if (initialized) { cufftDestroy(plan); }
     initialized = false;
   }
@@ -605,6 +809,19 @@ public:
     CUDA_RT_CALL(cudaMalloc(&d_tray_phi_fft, sizeof(cufftComplex) * padded_volume));
     CUDA_RT_CALL(cudaMalloc(&d_item, sizeof(cufftComplex) * padded_volume));
     CUDA_RT_CALL(cudaMalloc(&d_real_part, sizeof(int) * padded_volume));
+
+    // Phase 2: Allocate GPU-resident score computation buffers
+    CUDA_RT_CALL(cudaMalloc(&d_collision_result, sizeof(int) * init_volume));
+    CUDA_RT_CALL(cudaMalloc(&d_proximity_result, sizeof(int) * init_volume));
+    CUDA_RT_CALL(cudaMalloc(&d_scores, sizeof(double) * init_volume));
+    CUDA_RT_CALL(cudaMalloc(&d_item2, sizeof(cufftComplex) * padded_volume));
+    // Allocate block reduction buffers (one entry per block)
+    int num_blocks = (init_volume + 255) / 256;
+    CUDA_RT_CALL(cudaMalloc(&d_block_argmin, sizeof(int) * num_blocks));
+    CUDA_RT_CALL(cudaMalloc(&d_block_min, sizeof(double) * num_blocks));
+
+    // Phase 3: Allocate raw int buffer for fused conversion (half H2D bandwidth)
+    CUDA_RT_CALL(cudaMalloc(&d_item_int, sizeof(int) * init_volume));
 
     // Create cuFFT plan
     auto [px, py, pz] = padded_size;
@@ -702,6 +919,134 @@ private:
     free(h_item);
     free(h_out);
   }
+
+  // Phase 2 & 3: Correlate and store result on GPU (no D2H transfer, fused int→float)
+  void correlate_to_gpu(const FlatVoxelGrid& item, cufftComplex* d_precomputed_fft,
+                        int* d_output, cufftComplex* d_work_buffer) {
+    // Pad item to tray size on CPU
+    FlatVoxelGrid padded_item = item;
+    padto3d_flat(padded_item, tray_size);
+
+    // Phase 3: Transfer raw ints to GPU (half the bandwidth vs float2)
+    // Then convert to complex and pad on GPU
+    CUDA_RT_CALL(cudaMemcpy(d_item_int, padded_item.ptr(), sizeof(int) * init_volume, cudaMemcpyHostToDevice));
+
+    // Zero the destination buffer
+    CUDA_RT_CALL(cudaMemset(d_work_buffer, 0, sizeof(cufftComplex) * padded_volume));
+
+    // Fused int→complex conversion and padding on GPU
+    int blockSize = 256;
+    int numBlocks = (init_volume + blockSize - 1) / blockSize;
+    auto [px, py, pz] = padded_size;
+    int_to_complex_copy_kernel<<<numBlocks, blockSize>>>(
+      d_item_int, d_work_buffer, nx, ny, nz, py, pz);
+    CUDA_RT_CALL(cudaDeviceSynchronize());
+
+    // FFT of item
+    CUFFT_CALL(cufftExecC2C(plan, d_work_buffer, d_work_buffer, CUFFT_FORWARD));
+
+    // Element-wise multiply with pre-computed FFT
+    LL blockSize2 = 256;
+    LL numBlocks2 = (padded_volume + blockSize2 - 1) / blockSize2;
+    element_wise_cmplx_mul<<<numBlocks2, blockSize2>>>(d_work_buffer, d_precomputed_fft, d_work_buffer, padded_volume);
+
+    // Inverse FFT
+    CUFFT_CALL(cufftExecC2C(plan, d_work_buffer, d_work_buffer, CUFFT_INVERSE));
+
+    // Scale, round, extract real
+    double scalar = 1.0 / ((double)padded_volume);
+    element_wise_cmplx_scalar_mul<<<numBlocks2, blockSize2>>>(d_work_buffer, scalar, padded_volume);
+    element_wise_round<<<numBlocks2, blockSize2>>>(d_work_buffer, padded_volume);
+    extract_real_kernel<<<numBlocks2, blockSize2>>>(d_work_buffer, d_real_part, padded_volume);
+
+    // Truncate and flip result entirely on GPU (no D2H transfer!)
+    // Note: we need to get padded dimensions again since we're inside the function
+    int total_output = init_volume;
+    int numBlocks3 = (total_output + 255) / 256;
+    auto [ppx, ppy, ppz] = padded_size;
+    truncate_flip_kernel<<<numBlocks3, 256>>>(
+      d_real_part, d_output, nx, ny, nz, ppx, ppy, ppz);
+    CUDA_RT_CALL(cudaDeviceSynchronize());
+    // No host memory to free - everything done on GPU!
+  }
+
+public:
+  // Phase 2: Complete search on GPU - returns only best position
+  Index3 search_on_gpu(const FlatVoxelGrid& item, bool& found, double& score, Index3 item_bounds_hi) {
+    SCOPED_TIMER("search_on_gpu_total");
+
+    auto [max_x, max_y, max_z] = item_bounds_hi;
+
+    // Correlate item with tray (collision) - keep on GPU
+    {
+      SCOPED_TIMER("gpu_correlate_collision");
+      correlate_to_gpu(item, d_tray_fft, d_collision_result, d_item);
+    }
+
+    // Correlate item with tray_phi (proximity) - keep on GPU
+    {
+      SCOPED_TIMER("gpu_correlate_proximity");
+      correlate_to_gpu(item, d_tray_phi_fft, d_proximity_result, d_item2);
+    }
+
+    // Compute scores on GPU
+    int total = init_volume;
+    int blockSize = 256;
+    int numBlocks = (total + blockSize - 1) / blockSize;
+
+    {
+      SCOPED_TIMER("compute_scores_gpu");
+      compute_scores_kernel<<<numBlocks, blockSize>>>(
+        d_collision_result, d_proximity_result, d_scores,
+        nx, ny, nz, max_x, max_y, max_z, P
+      );
+      CUDA_RT_CALL(cudaDeviceSynchronize());
+    }
+
+    // Find argmin using block reduction
+    int best_idx = -1;
+    double best_score = 1e30;
+
+    {
+      SCOPED_TIMER("argmin_reduction_gpu");
+      // Shared memory size: doubles for scores + ints for indices
+      size_t shared_size = blockSize * (sizeof(double) + sizeof(int));
+      argmin_reduction_kernel<<<numBlocks, blockSize, shared_size>>>(
+        d_scores, total, d_block_argmin, d_block_min
+      );
+      CUDA_RT_CALL(cudaDeviceSynchronize());
+
+      // Download block results and find global minimum on CPU
+      // (small arrays - only numBlocks elements)
+      std::vector<int> h_block_argmin(numBlocks);
+      std::vector<double> h_block_min(numBlocks);
+      CUDA_RT_CALL(cudaMemcpy(h_block_argmin.data(), d_block_argmin,
+                              sizeof(int) * numBlocks, cudaMemcpyDeviceToHost));
+      CUDA_RT_CALL(cudaMemcpy(h_block_min.data(), d_block_min,
+                              sizeof(double) * numBlocks, cudaMemcpyDeviceToHost));
+
+      for (int b = 0; b < numBlocks; b++) {
+        if (h_block_min[b] < best_score) {
+          best_score = h_block_min[b];
+          best_idx = h_block_argmin[b];
+        }
+      }
+    }
+
+    // Convert linear index back to 3D coordinates
+    if (best_idx >= 0 && best_score < 1e29) {
+      found = true;
+      score = best_score;
+      int k = best_idx % nz;
+      int j = (best_idx / nz) % ny;
+      int i = best_idx / (ny * nz);
+      return Index3(i, j, k);
+    } else {
+      found = false;
+      score = 0.0;
+      return Index3(-1, -1, -1);
+    }
+  }
 };
 
 // Global context pointer (managed by Python)
@@ -747,58 +1092,76 @@ void gpu_tray_correlate_proximity(const FlatVoxelGrid& item, FlatVoxelGrid& resu
 }
 
 // Complete FFT search using GPU-resident tray context
+// Phase 2: Uses GPU-resident score computation to avoid large D2H transfers
 Index3 fft_search_with_gpu_context(const FlatVoxelGrid& item, bool& found, double& score) {
+  SCOPED_TIMER("gpu_context_search_total");
+
+  if (!g_gpu_context || !g_gpu_context->initialized) {
+    throw std::runtime_error("GPU tray context not initialized");
+  }
+
+  // Get item bounds for OOB checking
+  Index3 tray_size = g_gpu_context->tray_size;
+  FlatVoxelGrid padded_item = item;
+  padto3d_flat(padded_item, tray_size);
+  Index3 lo, hi;
+  get_voxel_grid_bounds_flat(padded_item, lo, hi);
+
+  // Use GPU-resident search (Phase 2 optimization)
+  // This keeps collision and proximity metrics on GPU, does score computation
+  // and argmin on GPU, only transfers the final result (12 bytes)
+  return g_gpu_context->search_on_gpu(item, found, score, hi);
+}
+
+// =============================================================================
+// Phase 4: Batch Orientation Processing
+// =============================================================================
+
+// Structure to hold batch search results
+struct BatchSearchResult {
+  Index3 position;
+  bool found;
+  double score;
+};
+
+// Batch search: process multiple orientations, return best placement
+// This reduces Python↔C++ call overhead from 24 calls to 1 call per item
+void fft_search_batch(const std::vector<FlatVoxelGrid>& orientations,
+                      Index3& best_position, bool& found, double& best_score) {
+  SCOPED_TIMER("batch_search_total");
+
   if (!g_gpu_context || !g_gpu_context->initialized) {
     throw std::runtime_error("GPU tray context not initialized");
   }
 
   Index3 tray_size = g_gpu_context->tray_size;
-  int L = get<2>(tray_size);
-
-  // Get collision metric using GPU context
-  FlatVoxelGrid collision_metric;
-  g_gpu_context->correlate_with_tray(item, collision_metric);
-
-  // Mark out-of-bounds as colliding
-  Index3 lo, hi;
-  FlatVoxelGrid padded_item = item;
-  padto3d_flat(padded_item, tray_size);
-  get_voxel_grid_bounds_flat(padded_item, lo, hi);
-  auto [Mx, My, Mz] = hi;
-  int N = get<0>(tray_size), M = get<1>(tray_size), Lz = get<2>(tray_size);
-  for (int i = 0; i < N; i++) {
-    for (int j = 0; j < M; j++) {
-      for (int k = 0; k < Lz; k++) {
-        if (!((i + Mx <= N - 1) && (j + My <= M - 1) && (k + Mz <= Lz - 1)))
-          collision_metric(i, j, k) = max(collision_metric(i, j, k), 1);
-      }
-    }
-  }
-
-  // Get proximity metric using GPU context
-  FlatVoxelGrid proximity_metric;
-  g_gpu_context->correlate_with_tray_phi(item, proximity_metric);
-
-  // Find best placement
-  Index3 bestId(-1, -1, -1);
+  best_position = Index3(-1, -1, -1);
   found = false;
+  best_score = 1e30;
 
-  vector<Index3> non_colliding_loc;
-  where3d_flat(collision_metric, non_colliding_loc, 0);
+  for (const auto& item : orientations) {
+    // Skip if item is larger than tray
+    if (item.nx > std::get<0>(tray_size) ||
+        item.ny > std::get<1>(tray_size) ||
+        item.nz > std::get<2>(tray_size)) {
+      continue;
+    }
 
-  double bestVal = INF;
-  for (auto id : non_colliding_loc) {
-    auto [i, j, k] = id;
-    double qz = (k + 0.0) / (L + 0.0);
-    double metric_with_penalty = proximity_metric(i, j, k) + P * pow(qz, 3.0);
-    if (metric_with_penalty < bestVal) {
+    // Get item bounds
+    FlatVoxelGrid padded_item = item;
+    padto3d_flat(padded_item, tray_size);
+    Index3 lo, hi;
+    get_voxel_grid_bounds_flat(padded_item, lo, hi);
+
+    bool orientation_found = false;
+    double orientation_score = 0.0;
+    Index3 position = g_gpu_context->search_on_gpu(item, orientation_found, orientation_score, hi);
+
+    if (orientation_found && orientation_score < best_score) {
+      best_position = position;
       found = true;
-      bestId = id;
-      bestVal = metric_with_penalty;
-      score = metric_with_penalty;
+      best_score = orientation_score;
     }
   }
-
-  return bestId;
 }
 
