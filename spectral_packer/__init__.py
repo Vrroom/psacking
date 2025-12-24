@@ -64,6 +64,10 @@ try:
         make_tight,
         get_bounds,
         save_vox,
+        # GPU-resident tray functions
+        gpu_tray_init,
+        gpu_tray_search,
+        gpu_tray_cleanup,
     )
     _CORE_AVAILABLE = True
 except ImportError as e:
@@ -130,6 +134,10 @@ __all__ = [
     "make_tight",
     "get_bounds",
     "save_vox",
+    # GPU-resident tray functions
+    "gpu_tray_init",
+    "gpu_tray_search",
+    "gpu_tray_cleanup",
 ]
 
 
