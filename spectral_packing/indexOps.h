@@ -2,11 +2,8 @@
 #define INDEX_OPS_H 
 
 #include "error.h"
-#include <tuple> 
-#include <iostream>
+#include <tuple>
 #include "types.h"
-
-void print_index (Index3 id);
 
 Index3 sum(Index3 a, Index3 b);
 

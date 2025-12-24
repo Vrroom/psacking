@@ -90,9 +90,7 @@ void rotate_mesh_around_point (TriangleMesh_Ptr &mesh, float yaw, float pitch, f
   auto r  = rotation_matrix_from_euler_angles(yaw, pitch, roll); 
   auto t2 = create_translation_matrix(pt); 
   auto tr = t2 * r * t1;
-  cout << pt << endl;
-  cout << tr.mulPoint(pt) << endl;
-  mesh->applyTransform(t2 * r * t1); 
+  mesh->applyTransform(tr); 
 }
 
 // --------------------------------------------------------------
@@ -179,16 +177,16 @@ void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
   if (!same_size(get_size(a), get_size(b)))
     throw std::runtime_error("Input grids must be of the same size for convolution");
   Index3 paddedSize = make_tuple(2 * N + 1, 2 * M + 1, 2 * L + 1);
-  VoxelGrid a_cpy = a, b_cpy = b; 
+  VoxelGrid a_cpy = a, b_cpy = b;
   {
-    Timer tm("(dft_conv3): Padding Stuff"); 
+    SCOPED_TIMER("dft_conv3_cpu_padding");
     padto3d(a_cpy, paddedSize);
     padto3d(b_cpy, paddedSize);
   }
   int totalSize = (2 * N + 1) * (2 * M + 1) * (2 * L + 1);
-  fftw_complex *A, *B; 
+  fftw_complex *A, *B;
   {
-    Timer tm("(dft_conv3): Allocating and copying"); 
+    SCOPED_TIMER("dft_conv3_cpu_alloc");
     A = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * totalSize);
     B = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * totalSize);
     for (int i = 0; i < totalSize; i++) {
@@ -198,26 +196,26 @@ void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
     convertToFFTWComplex(a_cpy, A, paddedSize);
     convertToFFTWComplex(b_cpy, B, paddedSize);
   }
-  { 
-    Timer tm("(dft_conv3): fft3d 1");  
+  {
+    SCOPED_TIMER("dft_conv3_cpu_fft1");
     fft3d(A, A, paddedSize);
   }
-  { 
-    Timer tm("(dft_conv3): fft3d 2");  
+  {
+    SCOPED_TIMER("dft_conv3_cpu_fft2");
     fft3d(B, B, paddedSize);
   }
   {
-    Timer tm("(dft_conv3): Element wise mm");
+    SCOPED_TIMER("dft_conv3_cpu_mul");
     elementWiseMultiplication(A, B, paddedSize);
   }
   {
-    Timer tm("(dft_conv3): fft3d 3"); 
+    SCOPED_TIMER("dft_conv3_cpu_ifft");
     fft3d(A, A, paddedSize, true);
   }
   {
-    Timer tm("(dft_conv3): extract real and truncate"); 
-    extractRealPart(A, result, paddedSize); 
-    truncateto3d(result, get_size(a)); 
+    SCOPED_TIMER("dft_conv3_cpu_extract");
+    extractRealPart(A, result, paddedSize);
+    truncateto3d(result, get_size(a));
   }
   fftw_free(A);
   fftw_free(B);
@@ -225,17 +223,17 @@ void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
 #endif
 
 void dft_corr3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
-  VoxelGrid flipped_a = a; 
+  VoxelGrid flipped_a = a;
   {
-    Timer tm("(dft_corr3): First Flip");
+    SCOPED_TIMER("dft_corr3_flip1");
     flip3d(flipped_a);
   }
   {
-    Timer tm("(dft_corr3): dft_conv3");
+    SCOPED_TIMER("dft_corr3_conv");
     dft_conv3(flipped_a, b, result);
   }
   {
-    Timer tm("(dft_corr3): Second Flip"); 
+    SCOPED_TIMER("dft_corr3_flip2");
     flip3d(result);
   }
 }
@@ -558,11 +556,10 @@ void voxelize (TriangleMesh_Ptr &mesh, VoxelGrid &vg, int voxel_resolution=VOXEL
 
   // rasterize into voxels
   v3u resolution(mesh->bbox().extent() / tupleMax(mesh->bbox().extent()) * float(voxel_resolution));
-  cout << resolution << endl;
   Array3D<uchar> voxs(resolution);
   voxs.fill(0);
   {
-    Timer tm("rasterization");
+    SCOPED_TIMER("voxelize_rasterization");
     Console::progressTextInit((int)tris.size());
     ForIndex(t, tris.size()) {
       Console::progressTextUpdate(t);
@@ -577,7 +574,7 @@ void voxelize (TriangleMesh_Ptr &mesh, VoxelGrid &vg, int voxel_resolution=VOXEL
   // add inner voxels
 #if VOXEL_FILL_INSIDE
   {
-    Timer tm("fill");
+    SCOPED_TIMER("voxelize_fill");
     cerr << "filling in/out ... ";
 #if VOXEL_ROBUST_FILL
     fillInsideVoting(voxs);
@@ -601,7 +598,7 @@ Index3 fft_search_placement (const VoxelGrid &A, const VoxelGrid &tray, bool &fo
 
   FlatVoxelGrid collision_metric;
   {
-    Timer tm("(fft_search_placement): collision grid [flat]");
+    SCOPED_TIMER("fft_search_collision");
     collision_grid_flat(tray_flat, padded_a_flat, collision_metric);
   }
 
@@ -609,21 +606,21 @@ Index3 fft_search_placement (const VoxelGrid &A, const VoxelGrid &tray, bool &fo
   VoxelGrid tray_phi;
   FlatVoxelGrid tray_phi_flat;
   {
-    Timer tm("(fft_search_placement): distance");
+    SCOPED_TIMER("fft_search_distance");
     calculate_distance(tray, tray_phi);
     tray_phi_flat = to_flat(tray_phi);
   }
 
   FlatVoxelGrid proximity_metric;
   {
-    Timer tm("(fft_search_placement): proximity metric [flat]");
+    SCOPED_TIMER("fft_search_proximity");
     dft_corr3_flat(tray_phi_flat, padded_a_flat, proximity_metric);
   }
 
   Index3 bestId(-1, -1, -1);
   found = false;
   {
-    Timer tm("(fft_search_placement): optimal placement search");
+    SCOPED_TIMER("fft_search_find_best");
     vector<Index3> non_colliding_loc;
     where3d_flat(collision_metric, non_colliding_loc, 0);
 
@@ -670,7 +667,7 @@ Index3 fft_search_placement_with_cache(const VoxelGrid &A, const VoxelGrid &tray
 
   FlatVoxelGrid collision_metric;
   {
-    Timer tm("(fft_search_placement_with_cache): collision grid [flat]");
+    SCOPED_TIMER("fft_search_cached_collision");
     collision_grid_flat(tray_flat, padded_a_flat, collision_metric);
   }
 
@@ -678,14 +675,14 @@ Index3 fft_search_placement_with_cache(const VoxelGrid &A, const VoxelGrid &tray
 
   FlatVoxelGrid proximity_metric;
   {
-    Timer tm("(fft_search_placement_with_cache): proximity metric [flat]");
+    SCOPED_TIMER("fft_search_cached_proximity");
     dft_corr3_flat(tray_phi_flat, padded_a_flat, proximity_metric);
   }
 
   Index3 bestId(-1, -1, -1);
   found = false;
   {
-    Timer tm("(fft_search_placement_with_cache): optimal placement search");
+    SCOPED_TIMER("fft_search_cached_find_best");
     vector<Index3> non_colliding_loc;
     where3d_flat(collision_metric, non_colliding_loc, 0);
 
@@ -790,308 +787,6 @@ void place_in_tray (const VoxelGrid &item, VoxelGrid &tray, Index3 st_id, int va
   }
 }
 
-void run_tests () {
-  try {
-    {
-      // simple fft_search_placement test
-      cout << "Running Test 1 ... ";
-      {
-        VoxelGrid vg1 = {{{1}}, {{1}}, {{1}}}, vg2 = {{{0}, {1}, {1}}, {{0}, {0}, {1}}, {{0}, {1}, {1}}};
-        bool found = false;
-        double score; 
-        Index3 id = fft_search_placement(vg1, vg2, found, score); 
-        if (!found) 
-          raise_and_kill("(run_tests): Failed Test 1"); 
-        place_in_tray(vg1, vg2, id, 2); 
-        saveVoxelGrid(SRC_PATH "/test1.slab.vox", vg2);
-      }
-      {
-        VoxelGrid vg1 = {{{1}, {1}}}, vg2 = {{{0}, {1}, {1}}, {{0}, {0}, {1}}, {{0}, {1}, {1}}};
-        bool found = false;
-        double score;
-        Index3 id = fft_search_placement(vg1, vg2, found, score); 
-        if (!found) 
-          raise_and_kill("(run_tests): Failed Test 1"); 
-        place_in_tray(vg1, vg2, id, 2); 
-        saveVoxelGrid(SRC_PATH "/test2.slab.vox", vg2);
-      }
-      {
-       VoxelGrid tray = {{{0}, {0}, {0}}, {{0}, {0}, {0}}, {{0}, {0}, {0}}};
-       vector<VoxelGrid> vgs = {
-         {{{1}}, {{1}}, {{1}}},
-         {{{1}, {1}}}, 
-         {{{1}}},
-       };
-       int color_id = 1;
-       for (auto vg: vgs) {
-         bool found = false;
-         double score;
-         Index3 id = fft_search_placement(vg, tray, found, score); 
-         if (found) 
-           place_in_tray(vg, tray, id, color_id++); 
-         else break;
-       }
-       saveVoxelGrid(SRC_PATH "/test3.slab.vox", tray);
-      }
-      cout << "done." << endl;
-    }
-    {
-      cout << "Running Test 2 ... ";
-      TriangleMesh_Ptr mesh1(loadTriangleMesh(SRC_PATH "/1382602.stl"));
-      TriangleMesh_Ptr mesh2(loadTriangleMesh(SRC_PATH "/271303.stl"));
-
-      vector<VoxelGrid> vgs = { VoxelGrid(), VoxelGrid() }; 
-
-      voxelize(mesh1, vgs[0]);
-      voxelize(mesh2, vgs[1]);
-
-      VoxelGrid tray; 
-      resize3d(tray, Index3(300, 300, 300)); 
-
-      int color_id = 1;
-      for (auto vg: vgs) {
-        bool found = false;
-        double score;
-        Index3 id = fft_search_placement(vg, tray, found, score); 
-        if (found) 
-          place_in_tray(vg, tray, id, color_id++); 
-        else break;
-      }
-      saveVoxelGrid(SRC_PATH "/test4.slab.vox", tray);
-      cout << "done." << endl;
-    }
-    {
-      // test loading and storing of voxel grids
-      cout << "Running Test 3 ... ";
-      TriangleMesh_Ptr mesh(loadTriangleMesh(SRC_PATH "/1382602.stl"));
-      VoxelGrid vg;
-      voxelize(mesh, vg);
-      saveVoxelGrid(SRC_PATH "/test5.slab.vox", vg); 
-      cout << "done." << endl;
-    }
-    { 
-      // testing index operations
-      cout << "Running Test 4 ... ";
-      Index3 a(123, 12, 11), b (412, 214, 121); 
-      if (!same_size(sum(a, b), Index3(412 + 123, 214 + 12, 121 + 11)))
-        raise_and_kill("(run_tests): Failed Test 6"); 
-      print_index(a); 
-      print_index(b); 
-      print_index(sum(a, b)); 
-      if (is_in_range(a, a) || is_in_range(b, b))
-        raise_and_kill("(run_tests): Failed Test 6"); 
-      if (!is_in_range(a, sum(a, Index3(1, 1, 1))))
-        raise_and_kill("(run_tests): Failed Test 6"); 
-      cout << "done." << endl;
-    }
-    {
-      // test voxel grid operations
-      cout << "Running Test 5 ... ";
-      {
-        // min, max, argmin, argmax
-        VoxelGrid tray = {{{1}, {2}, {1}}, {{1}, {120}, {10}}, {{0}, {123}, {0}}};
-        if (min3d(tray) != at3d(tray, argmin3d(tray)) && min3d(tray) != 0) 
-          raise_and_kill("(run_tests): Failed Test 5"); 
-        if (max3d(tray) != at3d(tray, argmax3d(tray)) && max3d(tray) != 123) 
-          raise_and_kill("(run_tests): Failed Test 5"); 
-      }
-      {
-        // bfs for calculating distance
-        {
-          VoxelGrid tray = {{{0}, {0}, {0}}, {{0}, {1}, {0}}, {{0}, {0}, {0}}};
-          VoxelGrid ans = {{{2}, {1}, {2}}, {{1}, {0}, {1}}, {{2}, {1}, {2}}};
-          VoxelGrid dist; 
-          calculate_distance(tray, dist);
-          if (!same_grid(ans, dist)) 
-            raise_and_kill("(run_tests): Failed Test 5"); 
-          print_voxel_grid(dist);
-        }
-        {
-          VoxelGrid tray = {{{0, 0, 0}}, {{0, 1, 0}}, {{0, 0, 0}}};
-          VoxelGrid ans = {{{2, 1, 2}}, {{1, 0, 1}}, {{2, 1, 2}}};
-          VoxelGrid dist; 
-          calculate_distance(tray, dist);
-          if (!same_grid(ans, dist)) 
-            raise_and_kill("(run_tests): Failed Test 5"); 
-          print_voxel_grid(dist);
-        }
-        {
-          VoxelGrid tray = {{{0, 0, 0, 0}}, {{0, 1, 0, 0}}, {{0, 0, 0, 0}}};
-          VoxelGrid ans = {{{2, 1, 2, 3}}, {{1, 0, 1, 2}}, {{2, 1, 2, 3}}};
-          VoxelGrid dist; 
-          calculate_distance(tray, dist);
-          if (!same_grid(ans, dist)) 
-            raise_and_kill("(run_tests): Failed Test 5"); 
-          print_voxel_grid(dist);
-        }
-      }
-      {
-        // flip
-        VoxelGrid a = {{{2, 1, 2, 3}}, {{1, 0, 1, 2}}, {{2, 1, 8, 5}}};
-        VoxelGrid a_copy = a;
-        flip3d(a_copy); 
-        flip3d(a_copy); 
-        if (!same_grid(a_copy, a))
-          raise_and_kill("(run_tests): Failed Test 5"); 
-        flip3d(a_copy); 
-        VoxelGrid ans = {{{5, 8, 1, 2}}, {{2, 1, 0, 1}}, {{3, 2, 1, 2}}}; 
-        if (!same_grid(a_copy, ans))
-          raise_and_kill("(run_tests): Failed Test 5"); 
-      }
-      {
-        // voxel bounds
-        {
-          VoxelGrid a = {{{2, 1, 2, 3}}, {{1, 0, 1, 2}}, {{2, 1, 8, 5}}};
-          Index3 lo, hi;
-          get_voxel_grid_bounds(a, lo, hi); 
-          if (!(same_size(lo, Index3(0, 0, 0)) && same_size(hi, Index3(2, 0, 3))))
-            raise_and_kill("(run_tests): Failed Test 5"); 
-        }
-        {
-          VoxelGrid a = {
-            {{0, 1, 0, 0}, {0, 1, 0, 0}}, 
-            {{0, 1, 1, 0}, {0, 1, 1, 0}}, 
-            {{1, 0, 0, 0}, {0, 0, 0, 0}}
-          };
-          Index3 lo, hi;
-          get_voxel_grid_bounds(a, lo, hi); 
-          if (!(same_size(lo, Index3(0, 0, 0)) && same_size(hi, Index3(2, 1, 2))))
-            raise_and_kill("(run_tests): Failed Test 5"); 
-        }
-        {
-          VoxelGrid a = {
-            {{0, 1, 0, 0}, {0, 1, 0, 0}}, 
-            {{0, 1, 1, 0}, {0, 1, 1, 0}}, 
-            {{1, 0, 0, 0}, {0, 0, 0, 0}}
-          };
-          VoxelGrid res = {
-            {{0, 1, 0}, {0, 1, 0}}, 
-            {{0, 1, 1}, {0, 1, 1}}, 
-            {{1, 0, 0}, {0, 0, 0}}
-          };
-          make_voxel_grid_tight(a); 
-          print_voxel_grid(a);
-          if (!same_grid(a, res))
-            raise_and_kill("(run_tests): Failed Test 5"); 
-        }
-      }
-      {
-        // fill, where
-        VoxelGrid a = {
-          {{0, 1, 0, 0}, {0, 1, 0, 0}}, 
-          {{0, 1, 1, 0}, {0, 1, 1, 0}}, 
-          {{1, 0, 0, 0}, {0, 0, 0, 0}}
-        };
-        vector<Index3> idx;
-        where3d(a, idx, 1); 
-        if (idx.size() != 7) 
-          raise_and_kill("(run_tests): Failed Test 5");
-        if (!same_size(idx[0], Index3(0, 0, 1)))
-          raise_and_kill("(run_tests): Failed Test 5"); 
-        fill3d(a, 100); 
-        if (min3d(a) != max3d(a) && min3d(a) != 100) 
-          raise_and_kill("(run_tests): Failed Test 5"); 
-        idx.clear();
-        where3d(a, idx, 1);
-        if (idx.size() != 0)
-          raise_and_kill("(run_tests): Failed Test 5"); 
-      }
-      {
-        VoxelGrid a = {
-          {{0, 1, 0, 0}, {0, 1, 0, 0}}, 
-          {{0, 1, 1, 0}, {0, 1, 1, 0}}, 
-          {{1, 0, 0, 0}, {0, 0, 0, 0}}
-        };
-        VoxelGrid a1 = a, a2 = a;
-        padto3d(a1, Index3(5, 5, 5)); 
-        pad3d(a2, Index3(2, 3, 1)); 
-        if (!same_size(get_size(a1), get_size(a2)))
-          raise_and_kill("(run_tests): Failed Test 5"); 
-        if (!same_grid(a1, a2))
-          raise_and_kill("(run_tests): Failed Test 5"); 
-        print_voxel_grid(a1);
-      }
-      cout << "done." << endl;
-    }
-    {
-      cout << "Running Test 6 ... ";
-      // fourier transforms
-      {
-        VoxelGrid a = {{{1, 1, 1}}}; 
-        VoxelGrid b = {{{1, 2, 3}}}; 
-        VoxelGrid c = {{{1, 3, 6}}}; 
-        VoxelGrid res; 
-        dft_conv3(a, b, res); 
-        if (!same_grid(res, c))
-          raise_and_kill("(run_tests): Failed Test 6"); 
-        print_voxel_grid(res); 
-      }
-      {
-        VoxelGrid a = {{{1}, {11}, {2}, {5}}}; 
-        VoxelGrid b = {{{12}, {12}, {6}, {1}}}; 
-        VoxelGrid c = {{{12}, {144}, {162}, {151}}}; 
-        VoxelGrid res; 
-        dft_conv3(a, b, res); 
-        if (!same_grid(res, c))
-          raise_and_kill("(run_tests): Failed Test 6"); 
-        print_voxel_grid(res); 
-      }
-      {
-        VoxelGrid a = {{{1}}, {{0}}, {{1}}, {{0}}}; 
-        VoxelGrid b = {{{1}}, {{8}}, {{12}}, {{4}}}; 
-        VoxelGrid c = {{{1}}, {{8}}, {{13}}, {{12}}}; 
-        VoxelGrid res; 
-        dft_conv3(a, b, res); 
-        if (!same_grid(res, c))
-          raise_and_kill("(run_tests): Failed Test 6"); 
-        print_voxel_grid(res); 
-      }
-      {
-        VoxelGrid a = {{{1, 1, 1}}}; 
-        VoxelGrid b = {{{1, 2, 3}}}; 
-        VoxelGrid c = {{{6, 3, 1}}}; 
-        VoxelGrid res; 
-        dft_corr3(a, b, res); 
-        if (!same_grid(res, c))
-          raise_and_kill("(run_tests): Failed Test 6"); 
-        print_voxel_grid(res); 
-      }
-      {
-        VoxelGrid a = {{{1}, {11}, {2}, {5}}}; 
-        VoxelGrid b = {{{12}, {12}, {6}, {1}}}; 
-        VoxelGrid c = {{{161}, {186}, {84}, {60}}}; 
-        VoxelGrid res; 
-        dft_corr3(a, b, res); 
-        if (!same_grid(res, c))
-          raise_and_kill("(run_tests): Failed Test 6"); 
-        print_voxel_grid(res); 
-      }
-      {
-        VoxelGrid a = {{{1}}, {{0}}, {{1}}, {{0}}}; 
-        VoxelGrid b = {{{1}}, {{8}}, {{12}}, {{4}}}; 
-        VoxelGrid c = {{{13}}, {{8}}, {{1}}, {{0}}}; 
-        VoxelGrid res; 
-        dft_corr3(a, b, res); 
-        if (!same_grid(res, c))
-          raise_and_kill("(run_tests): Failed Test 6"); 
-        print_voxel_grid(res); 
-      }
-      {
-        VoxelGrid a = {{{1, 0, 0, 0}, {1, 0, 0, 0}, {1, 1, 0, 1}, {0, 0, 0, 0}}}; 
-        VoxelGrid b = {{{1, 1, 1, 0}, {0, 1, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}}}; 
-        VoxelGrid res;
-        collision_grid(a, b, res); 
-        print_voxel_grid(a);
-        print_voxel_grid(b);
-        print_voxel_grid(res);
-      }
-      cout << "done." << endl;
-    }
-  } catch (Fatal& e) {
-    cerr << "[ERROR] " << e.message() << endl;
-  }
-}
-
 void listdir (string dirpath, vector<string> &paths) {
   try {
     if (fs::exists(dirpath) && fs::is_directory(dirpath)) {
@@ -1128,10 +823,7 @@ void build_triangle_mesh_list (vector<string> &paths, vector<TriangleMesh_Ptr> &
       }
     } catch (...) {}
   }
-  sort_by_vals(trimesh_list, vols); 
-  for (auto p: acc) {
-    cout << p << endl;
-  }
+  sort_by_vals(trimesh_list, vols);
 }
 
 void pack (vector<TriangleMesh_Ptr> &meshes, VoxelGrid &tray) {
@@ -1167,7 +859,6 @@ void print_packing_density (const VoxelGrid &tray) {
 }
 
 int main() {
-  //run_tests();
   vector<string> paths;
   listdir(THINGIVERSE_PATH, paths);
   vector<TriangleMesh_Ptr> trimesh_list;

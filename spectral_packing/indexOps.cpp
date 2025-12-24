@@ -1,10 +1,5 @@
 #include "indexOps.h"
 
-void print_index (Index3 id) {
-  auto [N, M, L] = id; 
-  cout << N << " " << M << " " << L << endl;
-}
-
 Index3 sum(Index3 a, Index3 b) {
   return Index3(get<0>(a) + get<0>(b), get<1>(a) + get<1>(b), get<2>(a) + get<2>(b));
 }

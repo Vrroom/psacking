@@ -374,7 +374,7 @@ void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
   cufftComplex *h_A, *h_B; 
   int *h_out; 
   {
-    Timer tm("(dft_conv3): Copying as is to cufftComplex");
+    SCOPED_TIMER("dft_conv3_to_cufft_complex");
     h_A = (cufftComplex *) malloc(sizeof(cufftComplex) * init_volume);
     h_B = (cufftComplex *) malloc(sizeof(cufftComplex) * init_volume);
     h_out = (int *) malloc(sizeof(int) * padded_volume);
@@ -382,50 +382,47 @@ void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
     to_cufft_complex(b, h_B, get_size(a));
   }
 
-  cufftComplex *d_A = nullptr, *d_B = nullptr; 
+  cufftComplex *d_A = nullptr, *d_B = nullptr;
   int * d_real_part = nullptr;
-  cufftHandle plan; 
+  cufftHandle plan;
 
-  { 
-    Timer tm("(dft_conv3): CUDA operations");
-    CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_A), sizeof(cufftComplex) * init_volume)); 
-    CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_B), sizeof(cufftComplex) * init_volume)); 
-    CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_real_part), sizeof(int) * padded_volume)); 
+  {
+    SCOPED_TIMER("dft_conv3_cuda_ops");
+    CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_A), sizeof(cufftComplex) * init_volume));
+    CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_B), sizeof(cufftComplex) * init_volume));
+    CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_real_part), sizeof(int) * padded_volume));
 
-    CUDA_RT_CALL(cudaMemcpy(d_A, h_A, sizeof(cufftComplex) * init_volume, cudaMemcpyHostToDevice)); 
-    CUDA_RT_CALL(cudaMemcpy(d_B, h_B, sizeof(cufftComplex) * init_volume, cudaMemcpyHostToDevice)); 
+    CUDA_RT_CALL(cudaMemcpy(d_A, h_A, sizeof(cufftComplex) * init_volume, cudaMemcpyHostToDevice));
+    CUDA_RT_CALL(cudaMemcpy(d_B, h_B, sizeof(cufftComplex) * init_volume, cudaMemcpyHostToDevice));
 
-    pad_voxel_grid_cuda(d_A, get_size(a), padded_size); 
-    pad_voxel_grid_cuda(d_B, get_size(b), padded_size); 
+    pad_voxel_grid_cuda(d_A, get_size(a), padded_size);
+    pad_voxel_grid_cuda(d_B, get_size(b), padded_size);
 
     CUFFT_CALL(cufftCreate(&plan));
-    CUFFT_CALL(cufftPlan3d(&plan, nx, ny, nz, CUFFT_C2C)); 
+    CUFFT_CALL(cufftPlan3d(&plan, nx, ny, nz, CUFFT_C2C));
 
-    CUFFT_CALL(cufftExecC2C(plan, d_A, d_A, CUFFT_FORWARD)); 
-    CUFFT_CALL(cufftExecC2C(plan, d_B, d_B, CUFFT_FORWARD)); 
+    CUFFT_CALL(cufftExecC2C(plan, d_A, d_A, CUFFT_FORWARD));
+    CUFFT_CALL(cufftExecC2C(plan, d_B, d_B, CUFFT_FORWARD));
 
     LL blockSize = 256;
     LL numBlocks = (padded_volume + blockSize - 1) / blockSize;
 
-    element_wise_cmplx_mul<<<numBlocks, blockSize>>>(d_A, d_B, d_A, padded_volume); 
+    element_wise_cmplx_mul<<<numBlocks, blockSize>>>(d_A, d_B, d_A, padded_volume);
 
-    CUFFT_CALL(cufftExecC2C(plan, d_A, d_A, CUFFT_INVERSE)); 
+    CUFFT_CALL(cufftExecC2C(plan, d_A, d_A, CUFFT_INVERSE));
 
     double scalar = 1.0 / ((double) padded_volume);
-    element_wise_cmplx_scalar_mul<<<numBlocks, blockSize>>>(d_A, scalar, padded_volume); 
-    element_wise_round<<<numBlocks, blockSize>>>(d_A, padded_volume); 
-    extract_real_kernel<<<numBlocks, blockSize>>>(d_A, d_real_part, padded_volume); 
+    element_wise_cmplx_scalar_mul<<<numBlocks, blockSize>>>(d_A, scalar, padded_volume);
+    element_wise_round<<<numBlocks, blockSize>>>(d_A, padded_volume);
+    extract_real_kernel<<<numBlocks, blockSize>>>(d_A, d_real_part, padded_volume);
 
     cudaMemcpy(h_out, d_real_part, sizeof(int) * padded_volume, cudaMemcpyDeviceToHost);
   }
 
   {
-    Timer tm("(dft_conv3): Copying stuff back to result"); 
-    {
-      Timer a("(dft_conv3): to_voxel_grid");
-      to_voxel_grid(h_out, result, padded_size); 
-    }
-    truncateto3d(result, get_size(a)); 
+    SCOPED_TIMER("dft_conv3_to_voxel_grid");
+    to_voxel_grid(h_out, result, padded_size);
+    truncateto3d(result, get_size(a));
   }
 
   CUDA_RT_CALL(cudaFree(d_A))
@@ -671,13 +668,13 @@ void init_distance_grid (int *grid, int N, int L, int M) {
     grid[tid] = (grid[tid] == 1) ? 0 : N + L + M + 10;
 }
 
-void calculate_distance (const VoxelGrid &occ, VoxelGrid &dist) { 
+void calculate_distance (const VoxelGrid &occ, VoxelGrid &dist) {
   auto [N, M, L] = get_size(occ);
 
   LL init_volume = vol(get_size(occ));
   int *h_occ;
   {
-    Timer tm("(calculate_distance): Allocating stuff");
+    SCOPED_TIMER("calculate_distance_alloc");
     h_occ = (int *) malloc(sizeof(int) * init_volume);
     int cnt = 0;
     for (int i = 0; i < N; i++)
@@ -686,14 +683,14 @@ void calculate_distance (const VoxelGrid &occ, VoxelGrid &dist) {
           h_occ[cnt++] = occ[i][j][k];
   }
 
-  int *d_occ = nullptr; 
-  { 
-    Timer tm("(calculate_distance): CUDA operations");
-    CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_occ), sizeof(int) * init_volume)); 
-    CUDA_RT_CALL(cudaMemcpy(d_occ, h_occ, sizeof(int) * init_volume, cudaMemcpyHostToDevice)); 
+  int *d_occ = nullptr;
+  {
+    SCOPED_TIMER("calculate_distance_cuda");
+    CUDA_RT_CALL(cudaMalloc(reinterpret_cast<void **>(&d_occ), sizeof(int) * init_volume));
+    CUDA_RT_CALL(cudaMemcpy(d_occ, h_occ, sizeof(int) * init_volume, cudaMemcpyHostToDevice));
 
     LL blockSize = 256;
-    LL numBlocks; 
+    LL numBlocks;
 
     numBlocks = (N * M * L + blockSize - 1) / blockSize;
     init_distance_grid<<<numBlocks, blockSize>>>(d_occ, N, M, L);
@@ -713,13 +710,13 @@ void calculate_distance (const VoxelGrid &occ, VoxelGrid &dist) {
   }
 
   {
-    Timer tm("(calculate_distance): Copying stuff back to result"); 
+    SCOPED_TIMER("calculate_distance_copy_back");
     int cnt = 0;
-    resize3d(dist, get_size(occ)); 
+    resize3d(dist, get_size(occ));
     for (int i = 0; i < N; i++)
-      for (int j = 0; j < M; j++) 
-        for (int k = 0; k < L; k++) 
-          dist[i][j][k] = h_occ[cnt++]; 
+      for (int j = 0; j < M; j++)
+        for (int k = 0; k < L; k++)
+          dist[i][j][k] = h_occ[cnt++];
   }
 
   CUDA_RT_CALL(cudaFree(d_occ));

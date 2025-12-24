@@ -55,7 +55,7 @@ try:
         HEIGHT_PENALTY,
         fft_search_placement,
         fft_search_placement_with_cache,
-        fft_search_batch,  # Phase 4: Batch orientation processing
+        fft_search_batch,
         place_in_tray,
         voxelize_stl,
         dft_conv3,
@@ -69,10 +69,6 @@ try:
         gpu_tray_init,
         gpu_tray_search,
         gpu_tray_cleanup,
-        # Debug functions
-        gpu_tray_correlate_collision,
-        gpu_tray_correlate_proximity,
-        gpu_tray_correlate_proximity_fast,
     )
     _CORE_AVAILABLE = True
 except ImportError as e:
@@ -130,7 +126,7 @@ __all__ = [
     # Core functions (if available)
     "fft_search_placement",
     "fft_search_placement_with_cache",
-    "fft_search_batch",  # Phase 4: Batch orientation processing
+    "fft_search_batch",
     "place_in_tray",
     "voxelize_stl",
     "dft_conv3",
@@ -144,10 +140,6 @@ __all__ = [
     "gpu_tray_init",
     "gpu_tray_search",
     "gpu_tray_cleanup",
-    # Debug functions
-    "gpu_tray_correlate_collision",
-    "gpu_tray_correlate_proximity",
-    "gpu_tray_correlate_proximity_fast",
 ]
 
 
