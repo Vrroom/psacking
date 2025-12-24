@@ -260,6 +260,7 @@ class BinPacker:
         self,
         items: Sequence[np.ndarray],
         sort_by_volume: bool = True,
+        initial_tray: Optional[np.ndarray] = None,
     ) -> PackingResult:
         """
         Pack pre-voxelized items.
@@ -271,6 +272,10 @@ class BinPacker:
             Non-zero values indicate occupied voxels.
         sort_by_volume : bool, default True
             Sort items by volume (largest first) before packing.
+        initial_tray : np.ndarray, optional
+            Pre-filled tray to pack into. If provided, must match tray_size.
+            Non-zero values are treated as obstacles. Object IDs will start
+            after the maximum value in initial_tray.
 
         Returns
         -------
@@ -323,7 +328,18 @@ class BinPacker:
             original_indices = list(range(len(items)))
 
         # Initialize tray
-        tray = np.zeros(self.tray_size, dtype=np.int32)
+        if initial_tray is not None:
+            if initial_tray.shape != self.tray_size:
+                raise ValueError(
+                    f"initial_tray shape {initial_tray.shape} does not match "
+                    f"tray_size {self.tray_size}"
+                )
+            tray = initial_tray.astype(np.int32).copy()
+            # Start object IDs after max value in initial tray
+            id_offset = int(np.max(tray))
+        else:
+            tray = np.zeros(self.tray_size, dtype=np.int32)
+            id_offset = 0
         generation = 0
 
         placements = []
@@ -366,7 +382,7 @@ class BinPacker:
                     found_any = True
 
             if found_any:
-                item_id = num_placed + 1
+                item_id = id_offset + num_placed + 1
                 tray = place_in_tray(best_rotated_item, tray, best_position, item_id)
                 generation += 1
                 num_placed += 1
