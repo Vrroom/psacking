@@ -705,6 +705,51 @@ Index3 fft_search_placement_with_cache(const VoxelGrid &A, const VoxelGrid &tray
   return bestId;
 }
 
+/**
+ * Fast version that takes FlatVoxelGrid directly (no conversion overhead).
+ * Used by bindings for direct numpy → FlatVoxelGrid → result path.
+ */
+Index3 fft_search_placement_with_cache_flat(
+    const FlatVoxelGrid &item_flat,
+    const FlatVoxelGrid &tray_flat,
+    const FlatVoxelGrid &tray_phi_flat,
+    bool &found, double &score) {
+
+  Index3 tray_size = tray_flat.dims();
+  int L = get<2>(tray_size);
+
+  // Pad item to tray size
+  FlatVoxelGrid padded_item = item_flat;
+  padto3d_flat(padded_item, tray_size);
+
+  FlatVoxelGrid collision_metric;
+  collision_grid_flat(tray_flat, padded_item, collision_metric);
+
+  FlatVoxelGrid proximity_metric;
+  dft_corr3_flat(tray_phi_flat, padded_item, proximity_metric);
+
+  Index3 bestId(-1, -1, -1);
+  found = false;
+
+  vector<Index3> non_colliding_loc;
+  where3d_flat(collision_metric, non_colliding_loc, 0);
+
+  double bestVal = INF;
+  for (auto id : non_colliding_loc) {
+    auto [i, j, k] = id;
+    double qz = (k + 0.0) / (L + 0.0);
+    double metric_with_penalty = proximity_metric(i, j, k) + P * pow(qz, 3.0);
+    if (metric_with_penalty < bestVal) {
+      found = true;
+      bestId = id;
+      bestVal = metric_with_penalty;
+      score = metric_with_penalty;
+    }
+  }
+
+  return bestId;
+}
+
 void saveVoxelGrid(const char *fname, const VoxelGrid& vg) {
   Array3D<uchar> new_voxs;
   voxel_grid_to_array3d(vg, new_voxs); 

@@ -24,6 +24,10 @@ void dft_corr3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result);
 Index3 fft_search_placement(const VoxelGrid &A, const VoxelGrid &tray, bool &found, double &score);
 Index3 fft_search_placement_with_cache(const VoxelGrid &A, const VoxelGrid &tray,
                                         const VoxelGrid &tray_phi, bool &found, double &score);
+Index3 fft_search_placement_with_cache_flat(const FlatVoxelGrid &item_flat,
+                                             const FlatVoxelGrid &tray_flat,
+                                             const FlatVoxelGrid &tray_phi_flat,
+                                             bool &found, double &score);
 void place_in_tray(const VoxelGrid &item, VoxelGrid &tray, Index3 st_id, int val);
 void collision_grid(const VoxelGrid &tray, const VoxelGrid &item, VoxelGrid &corr);
 
@@ -196,23 +200,23 @@ py::tuple py_fft_search_placement_with_cache(
     py::array_t<int> tray,
     py::array_t<int> tray_distance
 ) {
-    VoxelGrid item_grid = numpy_to_voxel_grid(item);
-    VoxelGrid tray_grid = numpy_to_voxel_grid(tray);
-    VoxelGrid tray_phi = numpy_to_voxel_grid(tray_distance);
+    // Fast path: numpy → FlatVoxelGrid (single memcpy each)
+    FlatVoxelGrid item_flat = numpy_to_flat_grid(item);
+    FlatVoxelGrid tray_flat = numpy_to_flat_grid(tray);
+    FlatVoxelGrid tray_phi_flat = numpy_to_flat_grid(tray_distance);
 
     // Check if item is larger than tray
-    Index3 item_size = get_size(item_grid);
-    Index3 tray_size = get_size(tray_grid);
-    if (std::get<0>(item_size) > std::get<0>(tray_size) ||
-        std::get<1>(item_size) > std::get<1>(tray_size) ||
-        std::get<2>(item_size) > std::get<2>(tray_size)) {
+    if (item_flat.nx > tray_flat.nx ||
+        item_flat.ny > tray_flat.ny ||
+        item_flat.nz > tray_flat.nz) {
         return py::make_tuple(py::make_tuple(-1, -1, -1), false, 0.0);
     }
 
     bool found = false;
     double score = 0.0;
 
-    Index3 position = fft_search_placement_with_cache(item_grid, tray_grid, tray_phi, found, score);
+    Index3 position = fft_search_placement_with_cache_flat(
+        item_flat, tray_flat, tray_phi_flat, found, score);
 
     auto [x, y, z] = position;
     return py::make_tuple(py::make_tuple(x, y, z), found, score);
