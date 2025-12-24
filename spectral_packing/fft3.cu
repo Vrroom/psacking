@@ -1,6 +1,44 @@
 /**
+ * FFT-based 3D bin packing placement search
  * Based on https://github.com/NVIDIA/CUDALibrarySamples/tree/master/cuFFT/3d_c2c
- */ 
+ *
+ * ALGORITHM OVERVIEW
+ * ==================
+ * This implements spectral packing: using FFT-based cross-correlation to find
+ * valid placements for 3D voxelized objects in a bin (tray).
+ *
+ * Core idea:
+ *   Cross-correlation of item with tray gives collision count at each position.
+ *   Cross-correlation of item with distance field gives proximity score.
+ *   Best placement = position with zero collisions and lowest proximity score.
+ *
+ * For each item placement search:
+ *   1. Pad item to tray size, compute FFT(item)
+ *   2. Multiply with pre-computed FFT(flipped_tray) -> collision metric
+ *   3. Multiply with pre-computed FFT(flipped_distance_field) -> proximity metric
+ *   4. IFFT both, find position with collision=0 and minimum proximity score
+ *
+ * KEY OPTIMIZATIONS
+ * =================
+ * 1. GPU-resident tray FFTs (GPUTrayContext class)
+ *    The tray only changes when an item is placed, but we search many orientations
+ *    between placements. Pre-compute FFT(tray) and FFT(distance_field) once,
+ *    keep them on GPU, reuse for all orientation searches.
+ *
+ * 2. GPU-resident score computation (search_on_gpu method)
+ *    Instead of transferring large 3D correlation arrays to CPU for scoring,
+ *    compute scores entirely on GPU and only return the best position.
+ *    Reduces data transfer from ~24MB to 12 bytes per search.
+ *
+ * 3. Fused int->float conversion (correlate_to_gpu method)
+ *    Voxel grids are stored as int32. Instead of converting to float2 (8 bytes)
+ *    on CPU before transfer, send raw int32 (4 bytes) and convert on GPU.
+ *    Halves host-to-device bandwidth for item uploads.
+ *
+ * 4. Batch orientation processing (fft_search_batch function)
+ *    Process all 24 item orientations in one C++ call instead of 24 separate
+ *    Python->C++ calls. Reduces interpreter overhead.
+ */
 #include <array>
 #include <fftw3.h>
 #include <complex>
@@ -99,8 +137,11 @@ void extract_real_kernel(cufftComplex *A, int *B, int n) {
 }
 
 // =============================================================================
-// GPU-Resident Score Computation Kernels (Phase 2)
+// GPU-Resident Score Computation
 // =============================================================================
+// These kernels compute placement scores directly on GPU, avoiding the need
+// to transfer large 3D correlation arrays back to the CPU. Only the best
+// position (3 ints) is returned instead of the full score volume.
 
 // Compute penalty-adjusted scores on GPU, marking invalid positions with INF
 __global__
@@ -134,11 +175,12 @@ void compute_scores_kernel(const int* collision_metric, const int* proximity_met
 }
 
 // =============================================================================
-// Phase 3: Fused Int→Float Conversion Kernels
+// Fused Int-to-Complex Conversion
 // =============================================================================
-
-// Convert int array to cufftComplex on GPU (fused with padding)
-// This reduces H2D bandwidth by 50% (4 bytes/int vs 8 bytes/float2)
+// Voxel grids are stored as int32, but cuFFT needs cufftComplex (float2).
+// Naive approach: convert to float2 on CPU (8 bytes/voxel), then transfer.
+// Optimized: transfer raw int32 (4 bytes/voxel), convert on GPU.
+// This halves the host-to-device bandwidth requirement.
 __global__
 void int_to_complex_and_pad_kernel(const int* src, cufftComplex* dst,
                                     int src_nx, int src_ny, int src_nz,
@@ -329,7 +371,7 @@ void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
   LL padded_volume = vol(padded_size); 
 
   LL init_volume = vol(get_size(a));
-  cufftComplex *h_A, *h_B; // , *h_out_A; 
+  cufftComplex *h_A, *h_B; 
   int *h_out; 
   {
     Timer tm("(dft_conv3): Copying as is to cufftComplex");
@@ -390,8 +432,6 @@ void dft_conv3(const VoxelGrid &a, const VoxelGrid &b, VoxelGrid &result) {
   CUDA_RT_CALL(cudaFree(d_B))
   CUDA_RT_CALL(cudaFree(d_real_part))
   CUFFT_CALL(cufftDestroy(plan));
-  // Note: cudaDeviceReset() removed - it was resetting the entire CUDA context
-  // which is unnecessary and kills performance when called repeatedly
   free(h_A);
   free(h_B);
   free(h_out);
@@ -565,7 +605,6 @@ void fft3d (fftw_complex *in, fftw_complex *out, Index3 size, bool inverse) {
   CUDA_RT_CALL(cudaFree(d_data))
   CUFFT_CALL(cufftDestroy(plan));
   CUDA_RT_CALL(cudaStreamDestroy(stream));
-  // Note: cudaDeviceReset() removed - unnecessary context reset
 } 
 
 __global__ 
@@ -684,7 +723,6 @@ void calculate_distance (const VoxelGrid &occ, VoxelGrid &dist) {
   }
 
   CUDA_RT_CALL(cudaFree(d_occ));
-  // Note: cudaDeviceReset() removed - unnecessary context reset
   free(h_occ);
 }
 #endif
@@ -731,18 +769,16 @@ public:
   LL padded_volume;
   LL init_volume;
 
-  // Raw padded data of flipped tray (NOT pre-FFT'd - compute fresh each time for precision)
+  // Pre-computed FFT of flipped tray (for collision detection via cross-correlation)
   cufftComplex* d_tray_fft;
-  // Raw padded data of flipped tray_phi (NOT pre-FFT'd - compute fresh each time for precision)
+  // Pre-computed FFT of flipped distance field (for proximity scoring)
   cufftComplex* d_tray_phi_fft;
-  // Temporary buffer for fresh FFT computation
-  cufftComplex* d_tray_fft_temp;
 
   // Reusable buffers for item processing
   cufftComplex* d_item;
   int* d_real_part;
 
-  // Phase 2: GPU-resident score computation buffers
+  // GPU-resident score computation buffers (avoid large D2H transfers)
   int* d_collision_result;     // Collision metric (stays on GPU)
   int* d_proximity_result;     // Proximity metric (stays on GPU)
   double* d_scores;            // Score buffer for argmin
@@ -750,8 +786,8 @@ public:
   double* d_block_min;         // Block-level min values
   cufftComplex* d_item2;       // Second item buffer for parallel correlation
 
-  // Phase 3: Raw int buffer for fused conversion (half H2D bandwidth)
-  int* d_item_int;             // Raw int buffer for item upload
+  // Buffer for fused int->complex conversion (halves H2D bandwidth)
+  int* d_item_int;
 
   // cuFFT plan (reusable)
   cufftHandle plan;
@@ -812,7 +848,7 @@ public:
     CUDA_RT_CALL(cudaMalloc(&d_item, sizeof(cufftComplex) * padded_volume));
     CUDA_RT_CALL(cudaMalloc(&d_real_part, sizeof(int) * padded_volume));
 
-    // Phase 2: Allocate GPU-resident score computation buffers
+    // Allocate GPU-resident score computation buffers
     CUDA_RT_CALL(cudaMalloc(&d_collision_result, sizeof(int) * init_volume));
     CUDA_RT_CALL(cudaMalloc(&d_proximity_result, sizeof(int) * init_volume));
     CUDA_RT_CALL(cudaMalloc(&d_scores, sizeof(double) * init_volume));
@@ -822,7 +858,7 @@ public:
     CUDA_RT_CALL(cudaMalloc(&d_block_argmin, sizeof(int) * num_blocks));
     CUDA_RT_CALL(cudaMalloc(&d_block_min, sizeof(double) * num_blocks));
 
-    // Phase 3: Allocate raw int buffer for fused conversion (half H2D bandwidth)
+    // Allocate buffer for fused int->complex conversion
     CUDA_RT_CALL(cudaMalloc(&d_item_int, sizeof(int) * init_volume));
 
     // Create cuFFT plan
@@ -922,15 +958,15 @@ private:
     free(h_out);
   }
 
-  // Phase 2 & 3: Correlate and store result on GPU (no D2H transfer, fused int→float)
+  // Correlate item with pre-computed tray FFT, keeping result on GPU.
+  // Uses fused int->complex conversion to halve upload bandwidth.
   void correlate_to_gpu(const FlatVoxelGrid& item, cufftComplex* d_precomputed_fft,
                         int* d_output, cufftComplex* d_work_buffer) {
     // Pad item to tray size on CPU
     FlatVoxelGrid padded_item = item;
     padto3d_flat(padded_item, tray_size);
 
-    // Phase 3: Transfer raw ints to GPU (half the bandwidth vs float2)
-    // Then convert to complex and pad on GPU
+    // Transfer raw ints (4 bytes/voxel) instead of float2 (8 bytes/voxel)
     CUDA_RT_CALL(cudaMemcpy(d_item_int, padded_item.ptr(), sizeof(int) * init_volume, cudaMemcpyHostToDevice));
 
     // Zero the destination buffer
@@ -973,23 +1009,8 @@ private:
   }
 
 public:
-  // Debug: Run correlate_to_gpu and return the result (for testing)
-  void debug_correlate_to_gpu_proximity(const FlatVoxelGrid& item, FlatVoxelGrid& result) {
-    correlate_to_gpu(item, d_tray_phi_fft, d_proximity_result, d_item2);
-
-    // Download result from GPU
-    int init_volume = nx * ny * nz;
-    int* h_out = (int*)malloc(sizeof(int) * init_volume);
-    cudaMemcpy(h_out, d_proximity_result, sizeof(int) * init_volume, cudaMemcpyDeviceToHost);
-
-    result = FlatVoxelGrid(nx, ny, nz);
-    for (int i = 0; i < init_volume; i++) {
-      result.ptr()[i] = h_out[i];
-    }
-    free(h_out);
-  }
-
-  // Phase 2: Complete search on GPU - returns only best position
+  // Find best placement position entirely on GPU, returning only the result.
+  // Avoids transferring full collision/proximity arrays to CPU.
   Index3 search_on_gpu(const FlatVoxelGrid& item, bool& found, double& score, Index3 item_bounds_hi) {
     SCOPED_TIMER("search_on_gpu_total");
 
@@ -1109,16 +1130,8 @@ void gpu_tray_correlate_proximity(const FlatVoxelGrid& item, FlatVoxelGrid& resu
   g_gpu_context->correlate_with_tray_phi(item, result);
 }
 
-// Debug: Use the GPU-resident correlate_to_gpu path and download results
-void gpu_tray_correlate_proximity_fast(const FlatVoxelGrid& item, FlatVoxelGrid& result) {
-  if (!g_gpu_context || !g_gpu_context->initialized) {
-    throw std::runtime_error("GPU tray context not initialized");
-  }
-  g_gpu_context->debug_correlate_to_gpu_proximity(item, result);
-}
-
-// Complete FFT search using GPU-resident tray context
-// Phase 2: Uses GPU-resident score computation to avoid large D2H transfers
+// Search for best placement using cached tray FFTs on GPU.
+// Returns only the best position instead of full score arrays.
 Index3 fft_search_with_gpu_context(const FlatVoxelGrid& item, bool& found, double& score) {
   SCOPED_TIMER("gpu_context_search_total");
 
@@ -1133,25 +1146,16 @@ Index3 fft_search_with_gpu_context(const FlatVoxelGrid& item, bool& found, doubl
   Index3 lo, hi;
   get_voxel_grid_bounds_flat(padded_item, lo, hi);
 
-  // Use GPU-resident search (Phase 2 optimization)
-  // This keeps collision and proximity metrics on GPU, does score computation
-  // and argmin on GPU, only transfers the final result (12 bytes)
   return g_gpu_context->search_on_gpu(item, found, score, hi);
 }
 
 // =============================================================================
-// Phase 4: Batch Orientation Processing
+// Batch Orientation Processing
 // =============================================================================
-
-// Structure to hold batch search results
-struct BatchSearchResult {
-  Index3 position;
-  bool found;
-  double score;
-};
+// Process all item orientations in a single C++ call instead of calling from
+// Python for each orientation. Reduces interpreter overhead significantly.
 
 // Batch search: process multiple orientations, return best placement
-// This reduces Python↔C++ call overhead from 24 calls to 1 call per item
 void fft_search_batch(const std::vector<FlatVoxelGrid>& orientations,
                       Index3& best_position, bool& found, double& best_score) {
   SCOPED_TIMER("batch_search_total");
