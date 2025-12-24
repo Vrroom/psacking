@@ -10,6 +10,134 @@ from typing import List, Tuple, Callable
 import numpy as np
 
 
+# Base 90-degree rotation matrices (matching np.rot90 behavior)
+# RX: 90° around X axis, np.rot90(grid, k=1, axes=(1, 2))
+# Transforms: Y → Z, Z → -Y
+_RX = np.array([
+    [1, 0, 0],
+    [0, 0, -1],
+    [0, 1, 0],
+], dtype=np.float64)
+
+# RY: 90° around Y axis, np.rot90(grid, k=1, axes=(2, 0))
+# Transforms: Z → X, X → -Z
+_RY = np.array([
+    [0, 0, 1],
+    [0, 1, 0],
+    [-1, 0, 0],
+], dtype=np.float64)
+
+# RZ: 90° around Z axis, np.rot90(grid, k=1, axes=(0, 1))
+# Transforms: X → Y, Y → -X
+_RZ = np.array([
+    [0, -1, 0],
+    [1, 0, 0],
+    [0, 0, 1],
+], dtype=np.float64)
+
+_I = np.eye(3, dtype=np.float64)
+
+
+def _generate_rotation_matrices() -> List[np.ndarray]:
+    """Generate all 24 rotation matrices matching get_24_orientations() order.
+
+    The matrices are generated following the exact same pattern as
+    get_24_orientations() to ensure orientation_index maps correctly.
+    """
+    matrices = []
+
+    # Powers of base rotations
+    RX = _RX
+    RX2 = RX @ RX
+    RX3 = RX2 @ RX
+
+    RY = _RY
+    RY3 = RY @ RY @ RY
+
+    RZ = _RZ
+    RZ2 = RZ @ RZ
+    RZ3 = RZ2 @ RZ
+
+    # Face 1: Identity (top face up) + Z rotations
+    for Rz in [_I, RZ, RZ2, RZ3]:
+        matrices.append(Rz.copy())
+
+    # Face 2: RX (front face up) + Z rotations
+    for Rz in [_I, RZ, RZ2, RZ3]:
+        matrices.append(Rz @ RX)
+
+    # Face 3: RX² (bottom face up) + Z rotations
+    for Rz in [_I, RZ, RZ2, RZ3]:
+        matrices.append(Rz @ RX2)
+
+    # Face 4: RX³ (back face up) + Z rotations
+    for Rz in [_I, RZ, RZ2, RZ3]:
+        matrices.append(Rz @ RX3)
+
+    # Face 5: RY (right face up) + Z rotations
+    for Rz in [_I, RZ, RZ2, RZ3]:
+        matrices.append(Rz @ RY)
+
+    # Face 6: RY³ (left face up) + Z rotations
+    for Rz in [_I, RZ, RZ2, RZ3]:
+        matrices.append(Rz @ RY3)
+
+    return matrices
+
+
+# Pre-computed 3x3 rotation matrices for all 24 orientations
+ROTATION_MATRICES_3x3: List[np.ndarray] = _generate_rotation_matrices()
+
+
+def get_rotation_matrix_3x3(orientation_index: int) -> np.ndarray:
+    """Get the 3x3 rotation matrix for a given orientation index.
+
+    Parameters
+    ----------
+    orientation_index : int
+        Index from 0 to 23, matching the order returned by get_24_orientations().
+
+    Returns
+    -------
+    np.ndarray
+        3x3 rotation matrix.
+
+    Raises
+    ------
+    IndexError
+        If orientation_index is out of range [0, 23].
+    """
+    if not 0 <= orientation_index < 24:
+        raise IndexError(f"orientation_index must be 0-23, got {orientation_index}")
+    return ROTATION_MATRICES_3x3[orientation_index].copy()
+
+
+def get_rotation_matrix_4x4(orientation_index: int) -> np.ndarray:
+    """Get the 4x4 homogeneous rotation matrix for a given orientation index.
+
+    This is useful for Blender export where 4x4 transformation matrices
+    are required.
+
+    Parameters
+    ----------
+    orientation_index : int
+        Index from 0 to 23, matching the order returned by get_24_orientations().
+
+    Returns
+    -------
+    np.ndarray
+        4x4 homogeneous rotation matrix (rotation only, no translation).
+
+    Raises
+    ------
+    IndexError
+        If orientation_index is out of range [0, 23].
+    """
+    R = np.eye(4, dtype=np.float64)
+    R[:3, :3] = get_rotation_matrix_3x3(orientation_index)
+    return R
+
+
 def rotate_90_x(grid: np.ndarray) -> np.ndarray:
     """Rotate grid 90° around X axis."""
     # X stays, Y->Z, Z->-Y

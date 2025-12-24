@@ -14,12 +14,42 @@ Examples
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import numpy as np
 
 from .mesh_io import load_mesh
+
+
+@dataclass
+class VoxelizationInfo:
+    """Metadata for mapping voxel coordinates back to mesh coordinates.
+
+    This class stores the information needed to transform voxel grid
+    positions back to the original mesh coordinate system, which is
+    required for Blender export.
+
+    Attributes
+    ----------
+    mesh_path : Path
+        Path to the original mesh file.
+    mesh_bounds_min : np.ndarray
+        Minimum corner of the mesh bounding box (shape: (3,)).
+    mesh_bounds_max : np.ndarray
+        Maximum corner of the mesh bounding box (shape: (3,)).
+    pitch : float
+        Size of each voxel in mesh coordinate units.
+    voxel_shape : Tuple[int, int, int]
+        Shape of the resulting voxel grid (x, y, z).
+    """
+
+    mesh_path: Path
+    mesh_bounds_min: np.ndarray
+    mesh_bounds_max: np.ndarray
+    pitch: float
+    voxel_shape: Tuple[int, int, int]
 
 
 class Voxelizer:
@@ -84,15 +114,91 @@ class Voxelizer:
         # For STL files, try to use the C++ voxelizer (faster)
         if suffix == ".stl":
             try:
-                from . import _CORE_AVAILABLE, voxelize_stl
-                if _CORE_AVAILABLE:
-                    return voxelize_stl(str(path), self.resolution)
+                from . import voxelize_stl
+                return voxelize_stl(str(path), self.resolution)
             except Exception:
                 pass  # Fall back to Python voxelization
 
         # Load mesh and voxelize
         vertices, faces = load_mesh(path, validate=validate, repair=repair)
         return self.voxelize_mesh(vertices, faces)
+
+    def voxelize_file_with_info(
+        self,
+        path: Union[str, Path],
+        validate: bool = True,
+        repair: bool = True,
+    ) -> Tuple[np.ndarray, VoxelizationInfo]:
+        """
+        Voxelize a mesh from a file and return metadata for coordinate mapping.
+
+        This method is similar to `voxelize_file()` but also returns a
+        `VoxelizationInfo` object containing the metadata needed to map
+        voxel coordinates back to mesh coordinates. This is required for
+        Blender export functionality.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the mesh file.
+        validate : bool, default True
+            Validate the mesh during loading.
+        repair : bool, default True
+            Attempt to repair invalid meshes.
+
+        Returns
+        -------
+        grid : np.ndarray
+            3D int32 array with 1 for occupied voxels, 0 for empty.
+        info : VoxelizationInfo
+            Metadata for coordinate system transformation.
+        """
+        path = Path(path)
+
+        # Load mesh to get bounds before voxelization
+        vertices, faces = load_mesh(path, validate=validate, repair=repair)
+
+        try:
+            import trimesh
+        except ImportError:
+            raise ImportError(
+                "trimesh required for mesh voxelization with info. "
+                "Install with: pip install trimesh"
+            )
+
+        # Create trimesh object
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+
+        # Capture bounds before voxelization
+        bounds = mesh.bounds
+        mesh_bounds_min = bounds[0].copy()
+        mesh_bounds_max = bounds[1].copy()
+
+        # Calculate voxel pitch based on resolution
+        extents = mesh.extents
+        max_extent = extents.max()
+        pitch = max_extent / (self.resolution - 1)
+
+        # Voxelize
+        try:
+            voxelized = mesh.voxelized(pitch=pitch)
+            voxelized = voxelized.fill()
+            grid = voxelized.matrix.astype(np.int32)
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Trimesh voxelization failed: {e}. Using fallback method.")
+            grid = self._fallback_voxelize(mesh, pitch)
+
+        # Create info object
+        info = VoxelizationInfo(
+            mesh_path=path,
+            mesh_bounds_min=mesh_bounds_min,
+            mesh_bounds_max=mesh_bounds_max,
+            pitch=pitch,
+            voxel_shape=grid.shape,
+        )
+
+        return grid, info
 
     def voxelize_mesh(
         self,

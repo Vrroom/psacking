@@ -41,6 +41,11 @@ Index3 fft_search_with_gpu_context(const FlatVoxelGrid& item, bool& found, doubl
 void fft_search_batch(const std::vector<FlatVoxelGrid>& orientations,
                       Index3& best_position, bool& found, double& best_score);
 
+// GPU flood fill for interlocking detection - Algorithm 3 (from fft3.cu)
+void gpu_interlocking_free_positions(const int* h_collision_metric, int* h_result,
+                                     int nx, int ny, int nz,
+                                     int obj_max_x, int obj_max_y, int obj_max_z);
+
 // Forward declarations from LibSL (mesh loading)
 #include <LibSL/LibSL.h>
 void voxelize(TriangleMesh_Ptr &mesh, VoxelGrid &vg, int voxel_resolution);
@@ -493,6 +498,110 @@ py::tuple py_fft_search_batch(
 }
 
 // ============================================================================
+// GPU Interlocking-Free Positions (Algorithm 3)
+// ============================================================================
+
+/**
+ * Compute interlocking-free positions for placing an object in a tray.
+ *
+ * Implements Algorithm 3 from the paper: flood fill on collision metric.
+ * A position is interlocking-free if the object can be placed there AND
+ * moved out to the boundary without colliding with existing objects.
+ *
+ * @param tray 3D int32 array of current tray state (0=empty, non-zero=occupied)
+ * @param obj 3D int32 array of object to place (0=empty, non-zero=occupied)
+ * @return 3D int32 array where 1=interlocking-free position, 0=blocked/collision
+ */
+py::array_t<int> py_interlocking_free_positions(py::array_t<int> tray, py::array_t<int> obj) {
+    py::buffer_info tray_buf = tray.request();
+    py::buffer_info obj_buf = obj.request();
+
+    if (tray_buf.ndim != 3) {
+        throw std::runtime_error("Tray array must be 3-dimensional, got " +
+                                 std::to_string(tray_buf.ndim) + "D");
+    }
+    if (obj_buf.ndim != 3) {
+        throw std::runtime_error("Object array must be 3-dimensional, got " +
+                                 std::to_string(obj_buf.ndim) + "D");
+    }
+
+    int tray_nx = static_cast<int>(tray_buf.shape[0]);
+    int tray_ny = static_cast<int>(tray_buf.shape[1]);
+    int tray_nz = static_cast<int>(tray_buf.shape[2]);
+
+    int obj_nx = static_cast<int>(obj_buf.shape[0]);
+    int obj_ny = static_cast<int>(obj_buf.shape[1]);
+    int obj_nz = static_cast<int>(obj_buf.shape[2]);
+
+    int* tray_ptr = static_cast<int*>(tray_buf.ptr);
+    int* obj_ptr = static_cast<int*>(obj_buf.ptr);
+
+    // Find object bounds (max coordinates of non-zero voxels)
+    int obj_max_x = 0, obj_max_y = 0, obj_max_z = 0;
+    for (int i = 0; i < obj_nx; i++) {
+        for (int j = 0; j < obj_ny; j++) {
+            for (int k = 0; k < obj_nz; k++) {
+                if (obj_ptr[(i * obj_ny + j) * obj_nz + k] != 0) {
+                    if (i > obj_max_x) obj_max_x = i;
+                    if (j > obj_max_y) obj_max_y = j;
+                    if (k > obj_max_z) obj_max_z = k;
+                }
+            }
+        }
+    }
+
+    // Convert to VoxelGrid for correlation computation
+    VoxelGrid tray_vg, obj_vg, collision_vg;
+    resize3d(tray_vg, Index3(tray_nx, tray_ny, tray_nz));
+    resize3d(obj_vg, Index3(obj_nx, obj_ny, obj_nz));
+
+    for (int i = 0; i < tray_nx; i++) {
+        for (int j = 0; j < tray_ny; j++) {
+            for (int k = 0; k < tray_nz; k++) {
+                tray_vg[i][j][k] = tray_ptr[(i * tray_ny + j) * tray_nz + k];
+            }
+        }
+    }
+    for (int i = 0; i < obj_nx; i++) {
+        for (int j = 0; j < obj_ny; j++) {
+            for (int k = 0; k < obj_nz; k++) {
+                obj_vg[i][j][k] = obj_ptr[(i * obj_ny + j) * obj_nz + k];
+            }
+        }
+    }
+
+    // Pad object to tray size (required for FFT correlation)
+    Index3 tray_size(tray_nx, tray_ny, tray_nz);
+    padto3d(obj_vg, tray_size);
+
+    // Compute collision metric via FFT cross-correlation
+    collision_grid(tray_vg, obj_vg, collision_vg);
+
+    // Convert collision metric to flat array
+    int total = tray_nx * tray_ny * tray_nz;
+    std::vector<int> collision_flat(total);
+    for (int i = 0; i < tray_nx; i++) {
+        for (int j = 0; j < tray_ny; j++) {
+            for (int k = 0; k < tray_nz; k++) {
+                collision_flat[(i * tray_ny + j) * tray_nz + k] = collision_vg[i][j][k];
+            }
+        }
+    }
+
+    // Allocate output array
+    py::array_t<int> result({tray_nx, tray_ny, tray_nz});
+    auto result_buf = result.request();
+    int* h_result = static_cast<int*>(result_buf.ptr);
+
+    // Call GPU flood fill on collision metric
+    gpu_interlocking_free_positions(collision_flat.data(), h_result,
+                                    tray_nx, tray_ny, tray_nz,
+                                    obj_max_x, obj_max_y, obj_max_z);
+
+    return result;
+}
+
+// ============================================================================
 // Module Definition
 // ============================================================================
 
@@ -718,6 +827,29 @@ PYBIND11_MODULE(_core, m) {
               -------
               tuple
                   (position, found, score) for the best orientation
+          )pbdoc");
+
+    // GPU Interlocking-Free Positions (Algorithm 3)
+    m.def("interlocking_free_positions", &py_interlocking_free_positions,
+          py::arg("tray"), py::arg("obj"),
+          R"pbdoc(
+              Compute interlocking-free positions for placing an object in a tray.
+
+              Implements Algorithm 3 from the paper: flood fill on collision metric.
+              A position is interlocking-free if the object can be placed there AND
+              moved out to the boundary without colliding with existing objects.
+
+              Parameters
+              ----------
+              tray : numpy.ndarray
+                  3D int32 array of current tray state (0=empty, non-zero=occupied)
+              obj : numpy.ndarray
+                  3D int32 array of object to place (0=empty, non-zero=occupied)
+
+              Returns
+              -------
+              numpy.ndarray
+                  3D int32 array where 1=interlocking-free position, 0=blocked/collision
           )pbdoc");
 
     // Module-level constants

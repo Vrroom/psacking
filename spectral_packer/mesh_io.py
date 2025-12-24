@@ -142,6 +142,11 @@ def load_mesh(
             path, validate, repair, center, scale, force_watertight
         )
     elif _HAS_MESHIO:
+        if validate or repair or force_watertight:
+            warnings.warn(
+                "meshio fallback does not support validate/repair/force_watertight. "
+                "Install trimesh for full functionality: pip install trimesh"
+            )
         return _load_with_meshio(path, center, scale)
     else:
         raise ImportError(

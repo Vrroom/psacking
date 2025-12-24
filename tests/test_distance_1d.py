@@ -8,11 +8,7 @@ import numpy as np
 import pytest
 from collections import deque
 
-try:
-    from spectral_packer import calculate_distance
-    HAS_BINDINGS = True
-except ImportError:
-    HAS_BINDINGS = False
+from spectral_packer import calculate_distance
 
 
 def cpu_manhattan_distance(grid):
@@ -39,7 +35,6 @@ def cpu_manhattan_distance(grid):
     return dist
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestDistance1DBasic:
     """Basic 1D distance tests along each axis."""
 
@@ -107,7 +102,6 @@ class TestDistance1DBasic:
         assert gpu_dist[0, 0, N-1] == N - 1
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestDistance1DMultipleOccupancies:
     """1D tests with different occupancy patterns."""
 
@@ -193,7 +187,6 @@ class TestDistance1DMultipleOccupancies:
         np.testing.assert_array_equal(gpu_dist, cpu_dist)
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestDistance1DStress:
     """Stress tests with large 1D grids."""
 

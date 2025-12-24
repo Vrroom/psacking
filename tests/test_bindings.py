@@ -9,11 +9,6 @@ import pytest
 import numpy as np
 
 
-# Skip all tests if CUDA core is not available
-pytestmark = pytest.mark.skipif(
-    not pytest.importorskip("spectral_packer")._CORE_AVAILABLE,
-    reason="CUDA core module not available"
-)
 
 
 class TestFFTSearchPlacement:

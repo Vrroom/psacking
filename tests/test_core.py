@@ -9,10 +9,6 @@ import pytest
 import numpy as np
 
 
-pytestmark = pytest.mark.skipif(
-    not pytest.importorskip("spectral_packer")._CORE_AVAILABLE,
-    reason="CUDA core module not available"
-)
 
 
 class TestFFTConvolution:

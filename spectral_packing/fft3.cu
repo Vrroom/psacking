@@ -175,6 +175,193 @@ void compute_scores_kernel(const int* collision_metric, const int* proximity_met
 }
 
 // =============================================================================
+// GPU Flood Fill for Interlocking Detection (Algorithm 3 from paper)
+// =============================================================================
+// Parallel wavefront BFS on COLLISION METRIC (not occupancy).
+// The collision metric ζ_A,Ω(q) = number of overlapping voxels if object A
+// is placed at position q. Zero means valid placement, positive means collision.
+//
+// Algorithm:
+// 1. Compute collision metric via FFT cross-correlation
+// 2. Initialize labels: 2=collision, 1=non-collision (not yet reached)
+// 3. Seed boundary faces with 0 (feasible exit positions)
+// 4. Flood fill: propagate 0 to neighbors that are 1
+// 5. Return mask: 1 where label==0 (interlocking-free)
+
+// Kernel: Initialize labels based on collision metric and object bounds
+// label = 2 if collision (metric != 0) or out-of-bounds
+// label = 1 if non-collision
+__global__
+void init_labels_kernel(const int* collision_metric, int* labels,
+                        int nx, int ny, int nz,
+                        int obj_max_x, int obj_max_y, int obj_max_z) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = nx * ny * nz;
+  if (tid >= total) return;
+
+  // Convert linear index to 3D coordinates
+  int k = tid % nz;
+  int j = (tid / nz) % ny;
+  int i = tid / (ny * nz);
+
+  // Check if out-of-bounds (object would clip outside tray)
+  bool oob = (i + obj_max_x >= nx) || (j + obj_max_y >= ny) || (k + obj_max_z >= nz);
+
+  // Check collision
+  bool collides = (collision_metric[tid] != 0);
+
+  if (oob || collides) {
+    labels[tid] = 2;  // Blocked
+  } else {
+    labels[tid] = 1;  // Non-collision, not yet reached
+  }
+}
+
+// Kernel: Seed boundary faces where object can exit
+// For face at i=0, j=0, k=0: object can exit in -x, -y, -z direction
+// For face at i=nx-1-obj_max_x, etc.: object can exit in +x, +y, +z direction
+__global__
+void seed_boundary_interlocking_kernel(int* labels, int* changed,
+                                       int nx, int ny, int nz,
+                                       int obj_max_x, int obj_max_y, int obj_max_z) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = nx * ny * nz;
+  if (tid >= total) return;
+
+  // Only process if label is 1 (non-collision, not yet reached)
+  if (labels[tid] != 1) return;
+
+  // Convert linear index to 3D coordinates
+  int k = tid % nz;
+  int j = (tid / nz) % ny;
+  int i = tid / (ny * nz);
+
+  // Calculate exit faces (where object's corner would be at tray boundary)
+  int exit_i = max(0, nx - 1 - obj_max_x);
+  int exit_j = max(0, ny - 1 - obj_max_y);
+  int exit_k = max(0, nz - 1 - obj_max_z);
+
+  // Check if this position is on a boundary face where object can exit
+  bool is_exit_boundary =
+    (i == 0) || (j == 0) || (k == 0) ||  // Can exit in negative direction
+    (i == exit_i) || (j == exit_j) || (k == exit_k);  // Can exit in positive direction
+
+  if (is_exit_boundary) {
+    labels[tid] = 0;  // Mark as reachable/feasible
+    atomicExch(changed, 1);
+  }
+}
+
+// Kernel: Propagate reachability one level (6-connectivity) on labels
+__global__
+void flood_fill_interlocking_step_kernel(int* labels, int* changed,
+                                         int nx, int ny, int nz) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = nx * ny * nz;
+  if (tid >= total) return;
+
+  // Only process if label is 1 (non-collision, not yet reached)
+  if (labels[tid] != 1) return;
+
+  // Convert linear index to 3D coordinates
+  int k = tid % nz;
+  int j = (tid / nz) % ny;
+  int i = tid / (ny * nz);
+
+  // Check 6 neighbors (face-connected)
+  int neighbor_offsets[6][3] = {
+    {-1, 0, 0}, {1, 0, 0},
+    {0, -1, 0}, {0, 1, 0},
+    {0, 0, -1}, {0, 0, 1}
+  };
+
+  for (int n = 0; n < 6; n++) {
+    int ni = i + neighbor_offsets[n][0];
+    int nj = j + neighbor_offsets[n][1];
+    int nk = k + neighbor_offsets[n][2];
+
+    // Check bounds
+    if (ni >= 0 && ni < nx && nj >= 0 && nj < ny && nk >= 0 && nk < nz) {
+      int neighbor_idx = (ni * ny + nj) * nz + nk;
+      // If neighbor is reachable (label=0), this cell becomes reachable
+      if (labels[neighbor_idx] == 0) {
+        labels[tid] = 0;
+        atomicExch(changed, 1);
+        return;
+      }
+    }
+  }
+}
+
+// Kernel: Convert labels to output mask (1 where interlocking-free)
+__global__
+void labels_to_mask_kernel(const int* labels, int* output, int total) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < total) {
+    output[tid] = (labels[tid] == 0) ? 1 : 0;
+  }
+}
+
+// Host function: GPU flood fill on collision metric (Algorithm 3)
+// Computes interlocking-free positions for placing an object in a tray.
+// Returns 1 for interlocking-free positions, 0 for blocked/collision positions.
+void gpu_interlocking_free_positions(const int* h_collision_metric, int* h_result,
+                                     int nx, int ny, int nz,
+                                     int obj_max_x, int obj_max_y, int obj_max_z) {
+  int total = nx * ny * nz;
+  int blockSize = 256;
+  int numBlocks = (total + blockSize - 1) / blockSize;
+
+  // Allocate GPU memory
+  int* d_collision = nullptr;
+  int* d_labels = nullptr;
+  int* d_changed = nullptr;
+  CUDA_RT_CALL(cudaMalloc(&d_collision, sizeof(int) * total));
+  CUDA_RT_CALL(cudaMalloc(&d_labels, sizeof(int) * total));
+  CUDA_RT_CALL(cudaMalloc(&d_changed, sizeof(int)));
+
+  // Upload collision metric
+  CUDA_RT_CALL(cudaMemcpy(d_collision, h_collision_metric, sizeof(int) * total, cudaMemcpyHostToDevice));
+
+  // Initialize labels based on collision metric and bounds
+  init_labels_kernel<<<numBlocks, blockSize>>>(d_collision, d_labels, nx, ny, nz,
+                                                obj_max_x, obj_max_y, obj_max_z);
+  CUDA_RT_CALL(cudaDeviceSynchronize());
+
+  // Seed boundary cells
+  int h_changed = 0;
+  CUDA_RT_CALL(cudaMemset(d_changed, 0, sizeof(int)));
+  seed_boundary_interlocking_kernel<<<numBlocks, blockSize>>>(d_labels, d_changed,
+                                                               nx, ny, nz,
+                                                               obj_max_x, obj_max_y, obj_max_z);
+  CUDA_RT_CALL(cudaDeviceSynchronize());
+
+  // Iteratively propagate until no more changes
+  int max_iterations = nx + ny + nz;
+  for (int iter = 0; iter < max_iterations; iter++) {
+    CUDA_RT_CALL(cudaMemset(d_changed, 0, sizeof(int)));
+    flood_fill_interlocking_step_kernel<<<numBlocks, blockSize>>>(d_labels, d_changed,
+                                                                   nx, ny, nz);
+    CUDA_RT_CALL(cudaDeviceSynchronize());
+
+    CUDA_RT_CALL(cudaMemcpy(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost));
+    if (h_changed == 0) break;
+  }
+
+  // Convert labels to output mask
+  labels_to_mask_kernel<<<numBlocks, blockSize>>>(d_labels, d_labels, total);
+  CUDA_RT_CALL(cudaDeviceSynchronize());
+
+  // Download result
+  CUDA_RT_CALL(cudaMemcpy(h_result, d_labels, sizeof(int) * total, cudaMemcpyDeviceToHost));
+
+  // Cleanup
+  CUDA_RT_CALL(cudaFree(d_collision));
+  CUDA_RT_CALL(cudaFree(d_labels));
+  CUDA_RT_CALL(cudaFree(d_changed));
+}
+
+// =============================================================================
 // Fused Int-to-Complex Conversion
 // =============================================================================
 // Voxel grids are stored as int32, but cuFFT needs cufftComplex (float2).

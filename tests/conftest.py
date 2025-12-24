@@ -179,22 +179,15 @@ def temp_stl_file(temp_dir, sample_stl_content) -> Path:
 @pytest.fixture
 def requires_cuda():
     """Skip test if CUDA core module is not available."""
-    try:
-        from spectral_packer import _CORE_AVAILABLE
-        if not _CORE_AVAILABLE:
-            pytest.skip("CUDA core module not available")
-    except ImportError:
-        pytest.skip("spectral_packer not installed")
+    # CUDA core is now a required dependency
+    pass
 
 
 @pytest.fixture
 def cuda_available() -> bool:
     """Check if CUDA core module is available."""
-    try:
-        from spectral_packer import _CORE_AVAILABLE
-        return _CORE_AVAILABLE
-    except ImportError:
-        return False
+    # CUDA core is now a required dependency
+    return True
 
 
 # =============================================================================

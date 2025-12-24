@@ -22,7 +22,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from .mesh_io import load_mesh
-from .voxelizer import Voxelizer
+from .voxelizer import Voxelizer, VoxelizationInfo
 from .rotations import get_orientations, make_contiguous
 
 
@@ -55,6 +55,35 @@ class PlacementInfo:
 
 
 @dataclass
+class MeshPlacementInfo:
+    """Placement info with mesh-level metadata for Blender export.
+
+    This dataclass extends PlacementInfo with the metadata needed to
+    transform original mesh files to their packed positions for export
+    to Blender or other 3D applications.
+
+    Attributes
+    ----------
+    mesh_path : Path
+        Path to the original mesh file.
+    voxel_info : VoxelizationInfo
+        Voxelization metadata for coordinate mapping.
+    voxel_position : tuple of int
+        (x, y, z) position in voxel coordinates.
+    orientation_index : int
+        Index of the orientation used (0-23).
+    success : bool
+        Whether the item was successfully placed.
+    """
+
+    mesh_path: Path
+    voxel_info: VoxelizationInfo
+    voxel_position: Optional[Tuple[int, int, int]]
+    orientation_index: int
+    success: bool
+
+
+@dataclass
 class PackingResult:
     """Results from a packing operation.
 
@@ -84,6 +113,7 @@ class PackingResult:
     density: float = 0.0
     total_volume: int = 0
     bounding_box: Optional[Tuple[Tuple[int, int, int], Tuple[int, int, int]]] = None
+    mesh_placements: Optional[List[MeshPlacementInfo]] = None
 
     def get_item_mask(self, item_id: int) -> np.ndarray:
         """Get a binary mask for a specific item.
@@ -256,6 +286,75 @@ class BinPacker:
 
         return self.pack_voxels(voxels, sort_by_volume=sort_by_volume)
 
+    def pack_files_for_export(
+        self,
+        paths: Sequence[Union[str, Path]],
+        sort_by_volume: bool = True,
+        validate_meshes: bool = True,
+        repair_meshes: bool = True,
+    ) -> PackingResult:
+        """
+        Pack meshes from file paths and preserve metadata for Blender export.
+
+        This method is similar to `pack_files()` but also populates the
+        `mesh_placements` field in the result, which contains the metadata
+        needed to export packed objects to Blender with correct transforms.
+
+        Parameters
+        ----------
+        paths : sequence of str or Path
+            Paths to mesh files (STL, OBJ, PLY, etc.).
+        sort_by_volume : bool, default True
+            Sort items by volume (largest first) before packing.
+        validate_meshes : bool, default True
+            Validate meshes during loading.
+        repair_meshes : bool, default True
+            Attempt to repair invalid meshes.
+
+        Returns
+        -------
+        PackingResult
+            Packing results with `mesh_placements` populated for export.
+
+        Raises
+        ------
+        FileNotFoundError
+            If any mesh file does not exist.
+        MeshLoadError
+            If any mesh fails to load.
+        """
+        # Voxelize all meshes and collect metadata
+        voxels = []
+        voxel_infos = []
+        for path in paths:
+            path = Path(path)
+            voxel, info = self._voxelizer.voxelize_file_with_info(
+                path,
+                validate=validate_meshes,
+                repair=repair_meshes,
+            )
+            voxels.append(voxel)
+            voxel_infos.append(info)
+
+        # Pack using existing method
+        result = self.pack_voxels(voxels, sort_by_volume=sort_by_volume)
+
+        # Build mesh placements by matching item_index to original order
+        # Note: placements are sorted by item_index in pack_voxels()
+        mesh_placements = []
+        for placement in result.placements:
+            idx = placement.item_index
+            mesh_placements.append(MeshPlacementInfo(
+                mesh_path=voxel_infos[idx].mesh_path,
+                voxel_info=voxel_infos[idx],
+                voxel_position=placement.position,
+                orientation_index=placement.orientation_index,
+                success=placement.success,
+            ))
+
+        result.mesh_placements = mesh_placements
+        return result
+
     def pack_voxels(
         self,
         items: Sequence[np.ndarray],
@@ -286,16 +385,7 @@ class BinPacker:
         ------
         ValueError
             If items list is empty or contains invalid arrays.
-        RuntimeError
-            If the C++ core module is not available.
         """
-        from . import _CORE_AVAILABLE
-        if not _CORE_AVAILABLE:
-            raise RuntimeError(
-                "C++ core module not available. "
-                "Make sure the package was built with CUDA support."
-            )
-
         from . import (
             fft_search_placement,
             fft_search_placement_with_cache,
@@ -444,10 +534,6 @@ class BinPacker:
         score : float
             Placement score (lower is better), or 0.0 if not found.
         """
-        from . import _CORE_AVAILABLE
-        if not _CORE_AVAILABLE:
-            raise RuntimeError("C++ core module not available")
-
         from . import fft_search_placement
 
         if tray is None:

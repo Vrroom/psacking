@@ -11,11 +11,7 @@ import pytest
 from collections import deque
 from pathlib import Path
 
-try:
-    from spectral_packer import BinPacker
-    HAS_BINDINGS = True
-except ImportError:
-    HAS_BINDINGS = False
+from spectral_packer import BinPacker
 
 try:
     import matplotlib
@@ -276,7 +272,6 @@ def count_trapped_objects(tray, ring_mask=None):
     return len(trapped_ids), trapped_ids, len(all_ids)
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestSimpleRingInterlocking:
     """Test that objects get trapped inside simple closed rings."""
 
@@ -319,7 +314,6 @@ class TestSimpleRingInterlocking:
         assert n_trapped > 0, "Expected trapped objects"
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestComplexRingShapes:
     """Test more complex ring configurations."""
 
@@ -387,7 +381,6 @@ class TestComplexRingShapes:
             filename=VIZ_DIR / "05_irregular_ring.png")
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestRingWithSmallExit:
     """Test rings with small exits - large objects trapped, small can escape."""
 
@@ -429,7 +422,6 @@ class TestRingWithSmallExit:
             filename=VIZ_DIR / "07_ring_small_exit_2.png")
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestRingWithLargeExit:
     """Test rings with large exits - most objects can escape."""
 
@@ -519,7 +511,6 @@ class TestRingWithLargeExit:
         plt.close()
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestInterlockingSummary:
     """Summary test that reports test configuration."""
 

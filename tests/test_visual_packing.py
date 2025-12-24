@@ -10,11 +10,7 @@ import tempfile
 import os
 from pathlib import Path
 
-try:
-    from spectral_packer import BinPacker, fft_search_placement, place_in_tray
-    HAS_BINDINGS = True
-except ImportError:
-    HAS_BINDINGS = False
+from spectral_packer import BinPacker, fft_search_placement, place_in_tray
 
 try:
     import matplotlib
@@ -146,7 +142,6 @@ def visualize_2d_tray(tray, title="Packing Result", filename=None):
     return filename
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 @pytest.mark.skipif(not HAS_MATPLOTLIB, reason="matplotlib not available")
 class TestVisualPacking:
     """Visual tests that generate PNG images for manual inspection."""

@@ -48,39 +48,29 @@ from __future__ import annotations
 __version__ = "0.1.0"
 __author__ = "Spectral Packing Authors"
 
-# Import core C++ bindings
-try:
-    from ._core import (
-        VOXEL_RESOLUTION,
-        HEIGHT_PENALTY,
-        fft_search_placement,
-        fft_search_placement_with_cache,
-        fft_search_batch,
-        place_in_tray,
-        voxelize_stl,
-        dft_conv3,
-        dft_corr3,
-        calculate_distance,
-        collision_grid,
-        make_tight,
-        get_bounds,
-        save_vox,
-        # GPU-resident tray functions
-        gpu_tray_init,
-        gpu_tray_search,
-        gpu_tray_cleanup,
-    )
-    _CORE_AVAILABLE = True
-except ImportError as e:
-    import warnings
-    warnings.warn(
-        f"Failed to import C++ core module: {e}. "
-        "Some functionality will be unavailable. "
-        "Make sure the package was built correctly with CUDA support."
-    )
-    _CORE_AVAILABLE = False
-    VOXEL_RESOLUTION = 128
-    HEIGHT_PENALTY = 1e8
+# Import core C++ bindings (required)
+from ._core import (
+    VOXEL_RESOLUTION,
+    HEIGHT_PENALTY,
+    fft_search_placement,
+    fft_search_placement_with_cache,
+    fft_search_batch,
+    place_in_tray,
+    voxelize_stl,
+    dft_conv3,
+    dft_corr3,
+    calculate_distance,
+    collision_grid,
+    make_tight,
+    get_bounds,
+    save_vox,
+    # GPU-resident tray functions
+    gpu_tray_init,
+    gpu_tray_search,
+    gpu_tray_cleanup,
+    # GPU interlocking-free positions (Algorithm 3)
+    interlocking_free_positions,
+)
 
 # Import Python modules
 from .mesh_io import (
@@ -90,14 +80,25 @@ from .mesh_io import (
     MeshValidationError,
     SUPPORTED_FORMATS,
 )
-from .packer import BinPacker, PackingResult, PlacementInfo
-from .voxelizer import Voxelizer
+from .packer import BinPacker, PackingResult, PlacementInfo, MeshPlacementInfo
+from .voxelizer import Voxelizer, VoxelizationInfo
 from .rotations import (
     get_orientations,
     get_24_orientations,
     rotate_90_x,
     rotate_90_y,
     rotate_90_z,
+    get_rotation_matrix_3x3,
+    get_rotation_matrix_4x4,
+    ROTATION_MATRICES_3x3,
+)
+from .blender_export import (
+    export_to_blend,
+    is_blender_available,
+    compute_mesh_transform,
+    BlenderExportError,
+    NoMeshMetadataError,
+    UnsupportedFormatError,
 )
 
 __all__ = [
@@ -107,13 +108,25 @@ __all__ = [
     "BinPacker",
     "PackingResult",
     "PlacementInfo",
+    "MeshPlacementInfo",
     "Voxelizer",
+    "VoxelizationInfo",
+    # Blender export
+    "export_to_blend",
+    "is_blender_available",
+    "compute_mesh_transform",
+    "BlenderExportError",
+    "NoMeshMetadataError",
+    "UnsupportedFormatError",
     # Rotation utilities
     "get_orientations",
     "get_24_orientations",
     "rotate_90_x",
     "rotate_90_y",
     "rotate_90_z",
+    "get_rotation_matrix_3x3",
+    "get_rotation_matrix_4x4",
+    "ROTATION_MATRICES_3x3",
     # Mesh I/O
     "load_mesh",
     "get_mesh_info",
@@ -140,6 +153,8 @@ __all__ = [
     "gpu_tray_init",
     "gpu_tray_search",
     "gpu_tray_cleanup",
+    # GPU interlocking-free positions (Algorithm 3)
+    "interlocking_free_positions",
 ]
 
 
@@ -150,5 +165,6 @@ def is_cuda_available() -> bool:
     -------
     bool
         True if the CUDA-accelerated core module loaded successfully.
+        Always True since the module import is required.
     """
-    return _CORE_AVAILABLE
+    return True

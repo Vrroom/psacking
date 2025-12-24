@@ -11,19 +11,15 @@ import pytest
 import time
 from typing import Tuple
 
-try:
-    from spectral_packer import (
-        BinPacker,
-        get_orientations,
-        get_24_orientations,
-        rotate_90_x,
-        rotate_90_y,
-        rotate_90_z,
-        fft_search_placement,
-    )
-    HAS_BINDINGS = True
-except ImportError:
-    HAS_BINDINGS = False
+from spectral_packer import (
+    BinPacker,
+    get_orientations,
+    get_24_orientations,
+    rotate_90_x,
+    rotate_90_y,
+    rotate_90_z,
+    fft_search_placement,
+)
 
 
 class TestRotationCorrectness:
@@ -110,7 +106,6 @@ class TestRotationCorrectness:
         assert not np.array_equal(grid, rotated)
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestOrientationPacking:
     """Test that orientation sampling works in packing."""
 
@@ -156,7 +151,6 @@ class TestOrientationPacking:
         assert result_with_rot.num_placed == 1
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestTetrisStyle:
     """2D Tetris-style tests with small grids for visual verification."""
 
@@ -335,7 +329,6 @@ class TestTetrisStyle:
         assert result_1.num_placed >= 3
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestOrientationBenchmark:
     """Benchmark orientation sampling impact on packing."""
 

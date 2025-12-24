@@ -21,3 +21,9 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test data (STL files copied from Thingi10K)
+data/
+
+# Build directories
+spectral_packing/build_blender/

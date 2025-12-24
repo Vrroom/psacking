@@ -7,12 +7,7 @@ implemented in fft3.cu.
 import numpy as np
 import pytest
 
-# Try to import the C++ bindings
-try:
-    from spectral_packer import calculate_distance
-    HAS_BINDINGS = True
-except ImportError:
-    HAS_BINDINGS = False
+from spectral_packer import calculate_distance
 
 
 def cpu_manhattan_distance(grid: np.ndarray) -> np.ndarray:
@@ -51,7 +46,6 @@ def cpu_manhattan_distance(grid: np.ndarray) -> np.ndarray:
     return dist
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestDistanceCorrectness:
     """Tests for GPU distance computation correctness."""
 
@@ -193,7 +187,6 @@ class TestDistanceCorrectness:
         )
 
 
-@pytest.mark.skipif(not HAS_BINDINGS, reason="C++ bindings not available")
 class TestIndexingBug:
     """Specific tests to demonstrate the indexing bug in calculate_distance."""
 
