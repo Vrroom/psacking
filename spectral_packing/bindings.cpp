@@ -31,6 +31,12 @@ Index3 fft_search_placement_with_cache_flat(const FlatVoxelGrid &item_flat,
 void place_in_tray(const VoxelGrid &item, VoxelGrid &tray, Index3 st_id, int val);
 void collision_grid(const VoxelGrid &tray, const VoxelGrid &item, VoxelGrid &corr);
 
+// GPU-resident tray context functions (from fft3.cu)
+void gpu_tray_context_init(const FlatVoxelGrid& tray, const FlatVoxelGrid& tray_phi);
+void gpu_tray_context_cleanup();
+bool gpu_tray_context_is_initialized();
+Index3 fft_search_with_gpu_context(const FlatVoxelGrid& item, bool& found, double& score);
+
 // Forward declarations from LibSL (mesh loading)
 #include <LibSL/LibSL.h>
 void voxelize(TriangleMesh_Ptr &mesh, VoxelGrid &vg, int voxel_resolution);
@@ -391,6 +397,54 @@ void py_save_vox(py::array_t<int> grid, const std::string& path) {
 }
 
 // ============================================================================
+// GPU-Resident Tray Context Functions
+// ============================================================================
+
+/**
+ * Initialize GPU-resident tray context.
+ * Pre-computes FFT of tray and distance field, keeping them on GPU.
+ */
+void py_gpu_tray_init(py::array_t<int> tray, py::array_t<int> tray_distance) {
+    FlatVoxelGrid tray_flat = numpy_to_flat_grid(tray);
+    FlatVoxelGrid tray_phi_flat = numpy_to_flat_grid(tray_distance);
+    gpu_tray_context_init(tray_flat, tray_phi_flat);
+}
+
+/**
+ * Cleanup GPU-resident tray context and free GPU memory.
+ */
+void py_gpu_tray_cleanup() {
+    gpu_tray_context_cleanup();
+}
+
+/**
+ * Check if GPU tray context is initialized.
+ */
+bool py_gpu_tray_is_initialized() {
+    return gpu_tray_context_is_initialized();
+}
+
+/**
+ * Find optimal placement using GPU-resident tray context.
+ * Much faster than fft_search_placement_with_cache when testing multiple
+ * orientations, as tray data stays on GPU.
+ */
+py::tuple py_gpu_tray_search(py::array_t<int> item) {
+    if (!gpu_tray_context_is_initialized()) {
+        throw std::runtime_error("GPU tray context not initialized. Call gpu_tray_init() first.");
+    }
+
+    FlatVoxelGrid item_flat = numpy_to_flat_grid(item);
+
+    bool found = false;
+    double score = 0.0;
+    Index3 position = fft_search_with_gpu_context(item_flat, found, score);
+
+    auto [x, y, z] = position;
+    return py::make_tuple(py::make_tuple(x, y, z), found, score);
+}
+
+// ============================================================================
 // Module Definition
 // ============================================================================
 
@@ -543,6 +597,60 @@ PYBIND11_MODULE(_core, m) {
     m.def("save_vox", &py_save_vox,
           py::arg("grid"), py::arg("path"),
           "Save voxel grid to MagicaVoxel .vox format.");
+
+    // GPU-Resident Tray Context functions
+    m.def("gpu_tray_init", &py_gpu_tray_init,
+          py::arg("tray"), py::arg("tray_distance"),
+          R"pbdoc(
+              Initialize GPU-resident tray context for fast multi-orientation search.
+
+              Pre-computes FFT of tray and distance field, keeping them on GPU.
+              This avoids repeated tray transfers when testing multiple item orientations.
+
+              Parameters
+              ----------
+              tray : numpy.ndarray
+                  3D int32 array representing current tray state
+              tray_distance : numpy.ndarray
+                  Pre-computed distance field from calculate_distance(tray)
+
+              Note
+              ----
+              Call gpu_tray_cleanup() when done to free GPU memory.
+          )pbdoc");
+
+    m.def("gpu_tray_cleanup", &py_gpu_tray_cleanup,
+          "Free GPU memory used by the tray context.");
+
+    m.def("gpu_tray_is_initialized", &py_gpu_tray_is_initialized,
+          "Check if GPU tray context is initialized.");
+
+    m.def("gpu_tray_search", &py_gpu_tray_search,
+          py::arg("item"),
+          R"pbdoc(
+              Find optimal placement using GPU-resident tray context.
+
+              Much faster than fft_search_placement_with_cache when testing multiple
+              orientations of the same item, as tray data stays on GPU.
+
+              Parameters
+              ----------
+              item : numpy.ndarray
+                  3D int32 array representing the item (1=occupied, 0=empty)
+
+              Returns
+              -------
+              tuple
+                  (position, found, score) where:
+                  - position: (x, y, z) placement coordinates
+                  - found: bool, whether valid placement exists
+                  - score: float, placement quality (lower is better)
+
+              Raises
+              ------
+              RuntimeError
+                  If gpu_tray_init() was not called first
+          )pbdoc");
 
     // Module-level constants
     m.attr("VOXEL_RESOLUTION") = VOXEL_RESOLUTION;

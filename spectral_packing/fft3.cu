@@ -506,3 +506,299 @@ void calculate_distance (const VoxelGrid &occ, VoxelGrid &dist) {
 }
 #endif
 
+// =============================================================================
+// GPU-Resident Tray Context
+// =============================================================================
+// Keeps tray data on GPU between searches to avoid repeated transfers.
+// Pre-computes FFT of tray and tray_phi for fast correlation.
+
+// Helper kernel for padding: copy from small buffer to large padded buffer
+__global__
+void pad_copy_kernel(const cufftComplex* src, cufftComplex* dst,
+                     int src_nx, int src_ny, int src_nz,
+                     int dst_nx, int dst_ny, int dst_nz) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = src_nx * src_ny * src_nz;
+  if (tid < total) {
+    int k = tid % src_nz;
+    int j = (tid / src_nz) % src_ny;
+    int i = tid / (src_ny * src_nz);
+    int dst_idx = (i * dst_ny + j) * dst_nz + k;
+    dst[dst_idx] = src[tid];
+  }
+}
+
+void pad_voxel_grid_cuda_inplace(const cufftComplex* d_src, cufftComplex* d_dst,
+                                  Index3 src_size, Index3 dst_size) {
+  auto [sx, sy, sz] = src_size;
+  auto [dx, dy, dz] = dst_size;
+  int total = sx * sy * sz;
+  int blockSize = 256;
+  int numBlocks = (total + blockSize - 1) / blockSize;
+  pad_copy_kernel<<<numBlocks, blockSize>>>(d_src, d_dst, sx, sy, sz, dx, dy, dz);
+  CUDA_RT_CALL(cudaDeviceSynchronize());
+}
+
+class GPUTrayContext {
+public:
+  // Tray dimensions
+  int nx, ny, nz;
+  Index3 tray_size;
+  Index3 padded_size;
+  LL padded_volume;
+  LL init_volume;
+
+  // Pre-computed FFT of flipped tray (for collision correlation)
+  cufftComplex* d_tray_fft;
+  // Pre-computed FFT of flipped tray_phi (for proximity correlation)
+  cufftComplex* d_tray_phi_fft;
+
+  // Reusable buffers for item processing
+  cufftComplex* d_item;
+  int* d_real_part;
+
+  // cuFFT plan (reusable)
+  cufftHandle plan;
+
+  bool initialized;
+
+  GPUTrayContext() : d_tray_fft(nullptr), d_tray_phi_fft(nullptr),
+                     d_item(nullptr), d_real_part(nullptr),
+                     initialized(false) {}
+
+  ~GPUTrayContext() {
+    cleanup();
+  }
+
+  void cleanup() {
+    if (d_tray_fft) { cudaFree(d_tray_fft); d_tray_fft = nullptr; }
+    if (d_tray_phi_fft) { cudaFree(d_tray_phi_fft); d_tray_phi_fft = nullptr; }
+    if (d_item) { cudaFree(d_item); d_item = nullptr; }
+    if (d_real_part) { cudaFree(d_real_part); d_real_part = nullptr; }
+    if (initialized) { cufftDestroy(plan); }
+    initialized = false;
+  }
+
+  void initialize(const FlatVoxelGrid& tray, const FlatVoxelGrid& tray_phi) {
+    cleanup();
+
+    nx = tray.nx; ny = tray.ny; nz = tray.nz;
+    tray_size = Index3(nx, ny, nz);
+    padded_size = Index3(2 * nx + 1, 2 * ny + 1, 2 * nz + 1);
+    padded_volume = vol(padded_size);
+    init_volume = tray.size();
+
+    // Flip tray and tray_phi for correlation
+    FlatVoxelGrid flipped_tray = tray;
+    flip3d_flat(flipped_tray);
+    FlatVoxelGrid flipped_tray_phi = tray_phi;
+    flip3d_flat(flipped_tray_phi);
+
+    // Allocate host buffers for conversion
+    cufftComplex* h_tray = (cufftComplex*)malloc(sizeof(cufftComplex) * init_volume);
+    cufftComplex* h_tray_phi = (cufftComplex*)malloc(sizeof(cufftComplex) * init_volume);
+    flat_to_cufft_complex(flipped_tray, h_tray);
+    flat_to_cufft_complex(flipped_tray_phi, h_tray_phi);
+
+    // Allocate GPU memory
+    CUDA_RT_CALL(cudaMalloc(&d_tray_fft, sizeof(cufftComplex) * padded_volume));
+    CUDA_RT_CALL(cudaMalloc(&d_tray_phi_fft, sizeof(cufftComplex) * padded_volume));
+    CUDA_RT_CALL(cudaMalloc(&d_item, sizeof(cufftComplex) * padded_volume));
+    CUDA_RT_CALL(cudaMalloc(&d_real_part, sizeof(int) * padded_volume));
+
+    // Create cuFFT plan
+    auto [px, py, pz] = padded_size;
+    CUFFT_CALL(cufftCreate(&plan));
+    CUFFT_CALL(cufftPlan3d(&plan, px, py, pz, CUFFT_C2C));
+
+    // Upload and pad tray
+    cufftComplex* d_temp;
+    CUDA_RT_CALL(cudaMalloc(&d_temp, sizeof(cufftComplex) * init_volume));
+
+    // Process tray
+    CUDA_RT_CALL(cudaMemcpy(d_temp, h_tray, sizeof(cufftComplex) * init_volume, cudaMemcpyHostToDevice));
+    CUDA_RT_CALL(cudaMemset(d_tray_fft, 0, sizeof(cufftComplex) * padded_volume));
+    pad_voxel_grid_cuda_inplace(d_temp, d_tray_fft, tray_size, padded_size);
+    CUFFT_CALL(cufftExecC2C(plan, d_tray_fft, d_tray_fft, CUFFT_FORWARD));
+
+    // Process tray_phi
+    CUDA_RT_CALL(cudaMemcpy(d_temp, h_tray_phi, sizeof(cufftComplex) * init_volume, cudaMemcpyHostToDevice));
+    CUDA_RT_CALL(cudaMemset(d_tray_phi_fft, 0, sizeof(cufftComplex) * padded_volume));
+    pad_voxel_grid_cuda_inplace(d_temp, d_tray_phi_fft, tray_size, padded_size);
+    CUFFT_CALL(cufftExecC2C(plan, d_tray_phi_fft, d_tray_phi_fft, CUFFT_FORWARD));
+
+    CUDA_RT_CALL(cudaFree(d_temp));
+    free(h_tray);
+    free(h_tray_phi);
+
+    initialized = true;
+  }
+
+  // Compute correlation of item with pre-computed tray FFT
+  void correlate_with_tray(const FlatVoxelGrid& item, FlatVoxelGrid& result) {
+    correlate_internal(item, d_tray_fft, result);
+  }
+
+  // Compute correlation of item with pre-computed tray_phi FFT
+  void correlate_with_tray_phi(const FlatVoxelGrid& item, FlatVoxelGrid& result) {
+    correlate_internal(item, d_tray_phi_fft, result);
+  }
+
+private:
+  void correlate_internal(const FlatVoxelGrid& item, cufftComplex* d_precomputed_fft,
+                          FlatVoxelGrid& result) {
+    // Pad item to tray size
+    FlatVoxelGrid padded_item = item;
+    padto3d_flat(padded_item, tray_size);
+
+    // Convert to complex
+    cufftComplex* h_item = (cufftComplex*)malloc(sizeof(cufftComplex) * init_volume);
+    flat_to_cufft_complex(padded_item, h_item);
+
+    // Upload item
+    cufftComplex* d_temp;
+    CUDA_RT_CALL(cudaMalloc(&d_temp, sizeof(cufftComplex) * init_volume));
+    CUDA_RT_CALL(cudaMemcpy(d_temp, h_item, sizeof(cufftComplex) * init_volume, cudaMemcpyHostToDevice));
+
+    // Pad on GPU
+    CUDA_RT_CALL(cudaMemset(d_item, 0, sizeof(cufftComplex) * padded_volume));
+    pad_voxel_grid_cuda_inplace(d_temp, d_item, tray_size, padded_size);
+    CUDA_RT_CALL(cudaFree(d_temp));
+
+    // FFT of item
+    CUFFT_CALL(cufftExecC2C(plan, d_item, d_item, CUFFT_FORWARD));
+
+    // Element-wise multiply with pre-computed FFT
+    LL blockSize = 256;
+    LL numBlocks = (padded_volume + blockSize - 1) / blockSize;
+    element_wise_cmplx_mul<<<numBlocks, blockSize>>>(d_item, d_precomputed_fft, d_item, padded_volume);
+
+    // Inverse FFT
+    CUFFT_CALL(cufftExecC2C(plan, d_item, d_item, CUFFT_INVERSE));
+
+    // Scale, round, extract real
+    double scalar = 1.0 / ((double)padded_volume);
+    element_wise_cmplx_scalar_mul<<<numBlocks, blockSize>>>(d_item, scalar, padded_volume);
+    element_wise_round<<<numBlocks, blockSize>>>(d_item, padded_volume);
+    extract_real_kernel<<<numBlocks, blockSize>>>(d_item, d_real_part, padded_volume);
+
+    // Copy back
+    int* h_out = (int*)malloc(sizeof(int) * padded_volume);
+    CUDA_RT_CALL(cudaMemcpy(h_out, d_real_part, sizeof(int) * padded_volume, cudaMemcpyDeviceToHost));
+
+    // Convert to result and truncate
+    to_flat_grid(h_out, result, padded_size);
+    FlatVoxelGrid truncated(nx, ny, nz);
+    for (int i = 0; i < nx; i++) {
+      for (int j = 0; j < ny; j++) {
+        std::memcpy(&truncated(i, j, 0), &result(i, j, 0), nz * sizeof(int));
+      }
+    }
+    result = std::move(truncated);
+
+    // Flip result (completing the correlation)
+    flip3d_flat(result);
+
+    free(h_item);
+    free(h_out);
+  }
+};
+
+// Global context pointer (managed by Python)
+static GPUTrayContext* g_gpu_context = nullptr;
+
+void gpu_tray_context_init(const FlatVoxelGrid& tray, const FlatVoxelGrid& tray_phi) {
+  if (!g_gpu_context) {
+    g_gpu_context = new GPUTrayContext();
+  }
+  g_gpu_context->initialize(tray, tray_phi);
+}
+
+void gpu_tray_context_cleanup() {
+  if (g_gpu_context) {
+    delete g_gpu_context;
+    g_gpu_context = nullptr;
+  }
+}
+
+bool gpu_tray_context_is_initialized() {
+  return g_gpu_context && g_gpu_context->initialized;
+}
+
+Index3 gpu_tray_context_dims() {
+  if (!g_gpu_context || !g_gpu_context->initialized) {
+    throw std::runtime_error("GPU tray context not initialized");
+  }
+  return g_gpu_context->tray_size;
+}
+
+void gpu_tray_correlate_collision(const FlatVoxelGrid& item, FlatVoxelGrid& result) {
+  if (!g_gpu_context || !g_gpu_context->initialized) {
+    throw std::runtime_error("GPU tray context not initialized");
+  }
+  g_gpu_context->correlate_with_tray(item, result);
+}
+
+void gpu_tray_correlate_proximity(const FlatVoxelGrid& item, FlatVoxelGrid& result) {
+  if (!g_gpu_context || !g_gpu_context->initialized) {
+    throw std::runtime_error("GPU tray context not initialized");
+  }
+  g_gpu_context->correlate_with_tray_phi(item, result);
+}
+
+// Complete FFT search using GPU-resident tray context
+Index3 fft_search_with_gpu_context(const FlatVoxelGrid& item, bool& found, double& score) {
+  if (!g_gpu_context || !g_gpu_context->initialized) {
+    throw std::runtime_error("GPU tray context not initialized");
+  }
+
+  Index3 tray_size = g_gpu_context->tray_size;
+  int L = get<2>(tray_size);
+
+  // Get collision metric using GPU context
+  FlatVoxelGrid collision_metric;
+  g_gpu_context->correlate_with_tray(item, collision_metric);
+
+  // Mark out-of-bounds as colliding
+  Index3 lo, hi;
+  FlatVoxelGrid padded_item = item;
+  padto3d_flat(padded_item, tray_size);
+  get_voxel_grid_bounds_flat(padded_item, lo, hi);
+  auto [Mx, My, Mz] = hi;
+  int N = get<0>(tray_size), M = get<1>(tray_size), Lz = get<2>(tray_size);
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < M; j++) {
+      for (int k = 0; k < Lz; k++) {
+        if (!((i + Mx <= N - 1) && (j + My <= M - 1) && (k + Mz <= Lz - 1)))
+          collision_metric(i, j, k) = max(collision_metric(i, j, k), 1);
+      }
+    }
+  }
+
+  // Get proximity metric using GPU context
+  FlatVoxelGrid proximity_metric;
+  g_gpu_context->correlate_with_tray_phi(item, proximity_metric);
+
+  // Find best placement
+  Index3 bestId(-1, -1, -1);
+  found = false;
+
+  vector<Index3> non_colliding_loc;
+  where3d_flat(collision_metric, non_colliding_loc, 0);
+
+  double bestVal = INF;
+  for (auto id : non_colliding_loc) {
+    auto [i, j, k] = id;
+    double qz = (k + 0.0) / (L + 0.0);
+    double metric_with_penalty = proximity_metric(i, j, k) + P * pow(qz, 3.0);
+    if (metric_with_penalty < bestVal) {
+      found = true;
+      bestId = id;
+      bestVal = metric_with_penalty;
+      score = metric_with_penalty;
+    }
+  }
+
+  return bestId;
+}
+
