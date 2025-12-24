@@ -36,6 +36,9 @@ void gpu_tray_context_init(const FlatVoxelGrid& tray, const FlatVoxelGrid& tray_
 void gpu_tray_context_cleanup();
 bool gpu_tray_context_is_initialized();
 Index3 fft_search_with_gpu_context(const FlatVoxelGrid& item, bool& found, double& score);
+void gpu_tray_correlate_collision(const FlatVoxelGrid& item, FlatVoxelGrid& result);
+void gpu_tray_correlate_proximity(const FlatVoxelGrid& item, FlatVoxelGrid& result);
+void gpu_tray_correlate_proximity_fast(const FlatVoxelGrid& item, FlatVoxelGrid& result);
 
 // Phase 4: Batch orientation processing (from fft3.cu)
 void fft_search_batch(const std::vector<FlatVoxelGrid>& orientations,
@@ -433,6 +436,45 @@ bool py_gpu_tray_is_initialized() {
 }
 
 /**
+ * Debug: Get GPU correlation result with tray (collision detection).
+ */
+py::array_t<int> py_gpu_tray_correlate_collision(py::array_t<int> item) {
+    if (!gpu_tray_context_is_initialized()) {
+        throw std::runtime_error("GPU tray context not initialized. Call gpu_tray_init() first.");
+    }
+    FlatVoxelGrid item_flat = numpy_to_flat_grid(item);
+    FlatVoxelGrid result;
+    gpu_tray_correlate_collision(item_flat, result);
+    return flat_grid_to_numpy(result);
+}
+
+/**
+ * Debug: Get GPU correlation result with tray_phi (proximity detection).
+ */
+py::array_t<int> py_gpu_tray_correlate_proximity(py::array_t<int> item) {
+    if (!gpu_tray_context_is_initialized()) {
+        throw std::runtime_error("GPU tray context not initialized. Call gpu_tray_init() first.");
+    }
+    FlatVoxelGrid item_flat = numpy_to_flat_grid(item);
+    FlatVoxelGrid result;
+    gpu_tray_correlate_proximity(item_flat, result);
+    return flat_grid_to_numpy(result);
+}
+
+/**
+ * Debug: Get GPU-resident correlation result (the fast path used by search).
+ */
+py::array_t<int> py_gpu_tray_correlate_proximity_fast(py::array_t<int> item) {
+    if (!gpu_tray_context_is_initialized()) {
+        throw std::runtime_error("GPU tray context not initialized. Call gpu_tray_init() first.");
+    }
+    FlatVoxelGrid item_flat = numpy_to_flat_grid(item);
+    FlatVoxelGrid result;
+    gpu_tray_correlate_proximity_fast(item_flat, result);
+    return flat_grid_to_numpy(result);
+}
+
+/**
  * Find optimal placement using GPU-resident tray context.
  * Much faster than fft_search_placement_with_cache when testing multiple
  * orientations, as tray data stays on GPU.
@@ -669,6 +711,18 @@ PYBIND11_MODULE(_core, m) {
 
     m.def("gpu_tray_is_initialized", &py_gpu_tray_is_initialized,
           "Check if GPU tray context is initialized.");
+
+    m.def("gpu_tray_correlate_collision", &py_gpu_tray_correlate_collision,
+          py::arg("item"),
+          "Debug: Get GPU correlation result with tray (collision detection).");
+
+    m.def("gpu_tray_correlate_proximity", &py_gpu_tray_correlate_proximity,
+          py::arg("item"),
+          "Debug: Get GPU correlation result with tray_phi (proximity detection).");
+
+    m.def("gpu_tray_correlate_proximity_fast", &py_gpu_tray_correlate_proximity_fast,
+          py::arg("item"),
+          "Debug: Get GPU-resident correlation result (the fast path used by search).");
 
     m.def("gpu_tray_search", &py_gpu_tray_search,
           py::arg("item"),

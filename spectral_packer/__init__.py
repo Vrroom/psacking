@@ -69,6 +69,10 @@ try:
         gpu_tray_init,
         gpu_tray_search,
         gpu_tray_cleanup,
+        # Debug functions
+        gpu_tray_correlate_collision,
+        gpu_tray_correlate_proximity,
+        gpu_tray_correlate_proximity_fast,
     )
     _CORE_AVAILABLE = True
 except ImportError as e:
@@ -140,6 +144,10 @@ __all__ = [
     "gpu_tray_init",
     "gpu_tray_search",
     "gpu_tray_cleanup",
+    # Debug functions
+    "gpu_tray_correlate_collision",
+    "gpu_tray_correlate_proximity",
+    "gpu_tray_correlate_proximity_fast",
 ]
 
 

@@ -731,10 +731,12 @@ public:
   LL padded_volume;
   LL init_volume;
 
-  // Pre-computed FFT of flipped tray (for collision correlation)
+  // Raw padded data of flipped tray (NOT pre-FFT'd - compute fresh each time for precision)
   cufftComplex* d_tray_fft;
-  // Pre-computed FFT of flipped tray_phi (for proximity correlation)
+  // Raw padded data of flipped tray_phi (NOT pre-FFT'd - compute fresh each time for precision)
   cufftComplex* d_tray_phi_fft;
+  // Temporary buffer for fresh FFT computation
+  cufftComplex* d_tray_fft_temp;
 
   // Reusable buffers for item processing
   cufftComplex* d_item;
@@ -971,6 +973,22 @@ private:
   }
 
 public:
+  // Debug: Run correlate_to_gpu and return the result (for testing)
+  void debug_correlate_to_gpu_proximity(const FlatVoxelGrid& item, FlatVoxelGrid& result) {
+    correlate_to_gpu(item, d_tray_phi_fft, d_proximity_result, d_item2);
+
+    // Download result from GPU
+    int init_volume = nx * ny * nz;
+    int* h_out = (int*)malloc(sizeof(int) * init_volume);
+    cudaMemcpy(h_out, d_proximity_result, sizeof(int) * init_volume, cudaMemcpyDeviceToHost);
+
+    result = FlatVoxelGrid(nx, ny, nz);
+    for (int i = 0; i < init_volume; i++) {
+      result.ptr()[i] = h_out[i];
+    }
+    free(h_out);
+  }
+
   // Phase 2: Complete search on GPU - returns only best position
   Index3 search_on_gpu(const FlatVoxelGrid& item, bool& found, double& score, Index3 item_bounds_hi) {
     SCOPED_TIMER("search_on_gpu_total");
@@ -1089,6 +1107,14 @@ void gpu_tray_correlate_proximity(const FlatVoxelGrid& item, FlatVoxelGrid& resu
     throw std::runtime_error("GPU tray context not initialized");
   }
   g_gpu_context->correlate_with_tray_phi(item, result);
+}
+
+// Debug: Use the GPU-resident correlate_to_gpu path and download results
+void gpu_tray_correlate_proximity_fast(const FlatVoxelGrid& item, FlatVoxelGrid& result) {
+  if (!g_gpu_context || !g_gpu_context->initialized) {
+    throw std::runtime_error("GPU tray context not initialized");
+  }
+  g_gpu_context->debug_correlate_to_gpu_proximity(item, result);
 }
 
 // Complete FFT search using GPU-resident tray context
