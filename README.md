@@ -1,9 +1,29 @@
 # Spectral 3D Bin Packing
 
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CUDA](https://img.shields.io/badge/CUDA-11.0+-green.svg)](https://developer.nvidia.com/cuda-toolkit)
+
+<p align="center">
+  <img src="renders/flyaround.gif" alt="360° flyaround of packed tray" width="600">
+</p>
+
+<p align="center">
+  <em>348 objects from Thingi10K packed into a 240×123×100mm tray at 60.8% density</em>
+</p>
+
+<p align="center">
+  <img src="renders/crosssection_front.gif" alt="Cross-section view" width="600">
+</p>
+
+<p align="center">
+  <em>Cross-section reveals dense interior packing</em>
+</p>
+
 GPU-accelerated 3D bin packing using FFT-based collision detection.
 
 This library implements the spectral packing algorithm described in
-[Scalable Spectral Packing](https://inkbit3d.com/packing/), which uses
+[Dense, Interlocking-Free and Scalable Spectral Packing of Generic 3D Objects](https://inkbit3d.com/packing/) (SIGGRAPH 2023), which uses
 Fast Fourier Transform (FFT) operations for efficient collision detection
 and optimal placement finding.
 
@@ -288,8 +308,8 @@ make -j$(nproc)
 ### Project Structure
 
 ```
-sc3344_final_cpsc424/
-├── README.md                 # This file
+psacking/
+├── README.md                # This file
 ├── pyproject.toml           # Python package config
 ├── CMakeLists.txt           # Root CMake config
 ├── spectral_packing/        # C++/CUDA implementation
@@ -310,8 +330,34 @@ sc3344_final_cpsc424/
 
 MIT License
 
+## Citation
+
+If you use this code in your research, please cite the original paper:
+
+```bibtex
+@article{10.1145/3592126,
+  author = {Cui, Qiaodong and Rong, Victor and Chen, Desai and Matusik, Wojciech},
+  title = {Dense, Interlocking-Free and Scalable Spectral Packing of Generic 3D Objects},
+  year = {2023},
+  issue_date = {August 2023},
+  publisher = {Association for Computing Machinery},
+  address = {New York, NY, USA},
+  volume = {42},
+  number = {4},
+  issn = {0730-0301},
+  url = {https://doi.org/10.1145/3592126},
+  doi = {10.1145/3592126},
+  abstract = {Packing 3D objects into a known container is a very common task in many industries such as packaging, transportation, and manufacturing. This important problem is known to be NP-hard and even approximate solutions are challenging. This is due to the difficulty of handling interactions between objects with arbitrary 3D geometries and a vast combinatorial search space. Moreover, the packing must be interlocking-free for real-world applications. In this work, we first introduce a novel packing algorithm to search for placement locations given an object. Our method leverages a discrete voxel representation. We formulate collisions between objects as correlations of functions computed efficiently using Fast Fourier Transform (FFT). To determine the best placements, we utilize a novel cost function, which is also computed efficiently using FFT. Finally, we show how interlocking detection and correction can be addressed in the same framework resulting in interlocking-free packing. We propose a challenging benchmark with thousands of 3D objects to evaluate our algorithm. Our method demonstrates state-of-the-art performance on the benchmark when compared to existing methods in both density and speed.},
+  journal = {ACM Trans. Graph.},
+  month = jul,
+  articleno = {141},
+  numpages = {14},
+  keywords = {3D packing}
+}
+```
+
 ## References
 
-- [Scalable Spectral Packing](https://inkbit3d.com/packing/) - Original paper
+- [Dense, Interlocking-Free and Scalable Spectral Packing of Generic 3D Objects](https://inkbit3d.com/packing/) - Original paper (SIGGRAPH 2023)
 - [pybind11](https://pybind11.readthedocs.io/) - C++/Python bindings
 - [trimesh](https://trimsh.org/) - Mesh processing library
