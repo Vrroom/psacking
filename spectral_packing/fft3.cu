@@ -174,6 +174,46 @@ void compute_scores_kernel(const int* collision_metric, const int* proximity_met
   }
 }
 
+// Compute scores with interlocking constraint (Section 4.3 from paper)
+// Positions must be both collision-free AND interlocking-free
+__global__
+void compute_scores_with_interlocking_kernel(
+    const int* collision_metric, const int* proximity_metric,
+    const int* interlocking_mask,  // 1=interlocking-free, 0=blocked
+    double* scores, int nx, int ny, int nz,
+    int max_x, int max_y, int max_z,
+    double height_penalty) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = nx * ny * nz;
+  if (tid < total) {
+    int k = tid % nz;
+    int j = (tid / nz) % ny;
+    int i = tid / (ny * nz);
+
+    // Check collision
+    if (collision_metric[tid] != 0) {
+      scores[tid] = 1e30;  // Invalid: collision
+      return;
+    }
+
+    // Check interlocking constraint (Section 4.3)
+    if (interlocking_mask[tid] != 1) {
+      scores[tid] = 1e30;  // Invalid: would cause interlocking
+      return;
+    }
+
+    // Check out-of-bounds
+    if (!((i + max_x <= nx - 1) && (j + max_y <= ny - 1) && (k + max_z <= nz - 1))) {
+      scores[tid] = 1e30;  // Invalid: OOB
+      return;
+    }
+
+    // Compute penalty-adjusted score
+    double qz = (double)k / (double)nz;
+    scores[tid] = (double)proximity_metric[tid] + height_penalty * qz * qz * qz;
+  }
+}
+
 // =============================================================================
 // GPU Flood Fill for Interlocking Detection (Algorithm 3 from paper)
 // =============================================================================
@@ -357,6 +397,59 @@ void gpu_interlocking_free_positions(const int* h_collision_metric, int* h_resul
 
   // Cleanup
   CUDA_RT_CALL(cudaFree(d_collision));
+  CUDA_RT_CALL(cudaFree(d_labels));
+  CUDA_RT_CALL(cudaFree(d_changed));
+}
+
+// GPU-resident flood fill: operates entirely on device memory
+// Input: d_collision_metric already on GPU
+// Output: d_result already allocated on GPU
+// This avoids H2D/D2H transfers during interlocking computation
+void gpu_interlocking_free_positions_device(
+    const int* d_collision_metric, int* d_result,
+    int nx, int ny, int nz,
+    int obj_max_x, int obj_max_y, int obj_max_z) {
+  int total = nx * ny * nz;
+  int blockSize = 256;
+  int numBlocks = (total + blockSize - 1) / blockSize;
+
+  // Allocate work buffers
+  int* d_labels = nullptr;
+  int* d_changed = nullptr;
+  CUDA_RT_CALL(cudaMalloc(&d_labels, sizeof(int) * total));
+  CUDA_RT_CALL(cudaMalloc(&d_changed, sizeof(int)));
+
+  // Initialize labels based on collision metric and bounds
+  init_labels_kernel<<<numBlocks, blockSize>>>(
+      d_collision_metric, d_labels, nx, ny, nz,
+      obj_max_x, obj_max_y, obj_max_z);
+  CUDA_RT_CALL(cudaDeviceSynchronize());
+
+  // Seed boundary cells
+  int h_changed = 0;
+  CUDA_RT_CALL(cudaMemset(d_changed, 0, sizeof(int)));
+  seed_boundary_interlocking_kernel<<<numBlocks, blockSize>>>(
+      d_labels, d_changed, nx, ny, nz,
+      obj_max_x, obj_max_y, obj_max_z);
+  CUDA_RT_CALL(cudaDeviceSynchronize());
+
+  // Iteratively propagate until no more changes
+  int max_iterations = nx + ny + nz;
+  for (int iter = 0; iter < max_iterations; iter++) {
+    CUDA_RT_CALL(cudaMemset(d_changed, 0, sizeof(int)));
+    flood_fill_interlocking_step_kernel<<<numBlocks, blockSize>>>(
+        d_labels, d_changed, nx, ny, nz);
+    CUDA_RT_CALL(cudaDeviceSynchronize());
+
+    CUDA_RT_CALL(cudaMemcpy(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost));
+    if (h_changed == 0) break;
+  }
+
+  // Convert labels to output mask (writes to d_result)
+  labels_to_mask_kernel<<<numBlocks, blockSize>>>(d_labels, d_result, total);
+  CUDA_RT_CALL(cudaDeviceSynchronize());
+
+  // Cleanup work buffers
   CUDA_RT_CALL(cudaFree(d_labels));
   CUDA_RT_CALL(cudaFree(d_changed));
 }
@@ -973,6 +1066,9 @@ public:
   // Buffer for fused int->complex conversion (halves H2D bandwidth)
   int* d_item_int;
 
+  // Buffer for interlocking-free mask (Section 4.3)
+  int* d_interlocking_mask;
+
   // cuFFT plan (reusable)
   cufftHandle plan;
 
@@ -983,6 +1079,7 @@ public:
                      d_collision_result(nullptr), d_proximity_result(nullptr),
                      d_scores(nullptr), d_block_argmin(nullptr), d_block_min(nullptr),
                      d_item2(nullptr), d_item_int(nullptr),
+                     d_interlocking_mask(nullptr),
                      initialized(false) {}
 
   ~GPUTrayContext() {
@@ -1001,6 +1098,7 @@ public:
     if (d_block_min) { cudaFree(d_block_min); d_block_min = nullptr; }
     if (d_item2) { cudaFree(d_item2); d_item2 = nullptr; }
     if (d_item_int) { cudaFree(d_item_int); d_item_int = nullptr; }
+    if (d_interlocking_mask) { cudaFree(d_interlocking_mask); d_interlocking_mask = nullptr; }
     if (initialized) { cufftDestroy(plan); }
     initialized = false;
   }
@@ -1044,6 +1142,9 @@ public:
 
     // Allocate buffer for fused int->complex conversion
     CUDA_RT_CALL(cudaMalloc(&d_item_int, sizeof(int) * init_volume));
+
+    // Allocate buffer for interlocking-free mask (Section 4.3)
+    CUDA_RT_CALL(cudaMalloc(&d_interlocking_mask, sizeof(int) * init_volume));
 
     // Create cuFFT plan
     auto [px, py, pz] = padded_size;
@@ -1270,6 +1371,92 @@ public:
       return Index3(-1, -1, -1);
     }
   }
+
+  // Find best placement with interlocking-free constraint (Section 4.3).
+  // Only considers positions that are both collision-free AND interlocking-free.
+  Index3 search_on_gpu_interlocking_free(const FlatVoxelGrid& item, bool& found, double& score, Index3 item_bounds_hi) {
+    SCOPED_TIMER("search_on_gpu_interlocking_free_total");
+
+    auto [max_x, max_y, max_z] = item_bounds_hi;
+
+    // Step 1: Correlate item with tray (collision) - keep on GPU
+    {
+      SCOPED_TIMER("gpu_correlate_collision_if");
+      correlate_to_gpu(item, d_tray_fft, d_collision_result, d_item);
+    }
+
+    // Step 2: Compute interlocking-free mask via GPU flood-fill
+    {
+      SCOPED_TIMER("gpu_flood_fill_interlocking");
+      // d_collision_result is already on GPU, compute interlocking mask in-place
+      gpu_interlocking_free_positions_device(
+          d_collision_result, d_interlocking_mask,
+          nx, ny, nz,
+          max_x, max_y, max_z);
+    }
+
+    // Step 3: Correlate item with tray_phi (proximity) - keep on GPU
+    {
+      SCOPED_TIMER("gpu_correlate_proximity_if");
+      correlate_to_gpu(item, d_tray_phi_fft, d_proximity_result, d_item2);
+    }
+
+    // Step 4: Compute scores with interlocking constraint on GPU
+    int total = init_volume;
+    int blockSize = 256;
+    int numBlocks = (total + blockSize - 1) / blockSize;
+
+    {
+      SCOPED_TIMER("compute_scores_interlocking_gpu");
+      compute_scores_with_interlocking_kernel<<<numBlocks, blockSize>>>(
+        d_collision_result, d_proximity_result, d_interlocking_mask,
+        d_scores, nx, ny, nz, max_x, max_y, max_z, P
+      );
+      CUDA_RT_CALL(cudaDeviceSynchronize());
+    }
+
+    // Step 5: Find argmin using block reduction
+    int best_idx = -1;
+    double best_score = 1e30;
+
+    {
+      SCOPED_TIMER("argmin_reduction_interlocking_gpu");
+      size_t shared_size = blockSize * (sizeof(double) + sizeof(int));
+      argmin_reduction_kernel<<<numBlocks, blockSize, shared_size>>>(
+        d_scores, total, d_block_argmin, d_block_min
+      );
+      CUDA_RT_CALL(cudaDeviceSynchronize());
+
+      // Download block results and find global minimum on CPU
+      std::vector<int> h_block_argmin(numBlocks);
+      std::vector<double> h_block_min(numBlocks);
+      CUDA_RT_CALL(cudaMemcpy(h_block_argmin.data(), d_block_argmin,
+                              sizeof(int) * numBlocks, cudaMemcpyDeviceToHost));
+      CUDA_RT_CALL(cudaMemcpy(h_block_min.data(), d_block_min,
+                              sizeof(double) * numBlocks, cudaMemcpyDeviceToHost));
+
+      for (int b = 0; b < numBlocks; b++) {
+        if (h_block_min[b] < best_score) {
+          best_score = h_block_min[b];
+          best_idx = h_block_argmin[b];
+        }
+      }
+    }
+
+    // Convert linear index back to 3D coordinates
+    if (best_idx >= 0 && best_score < 1e29) {
+      found = true;
+      score = best_score;
+      int k = best_idx % nz;
+      int j = (best_idx / nz) % ny;
+      int i = best_idx / (ny * nz);
+      return Index3(i, j, k);
+    } else {
+      found = false;
+      score = 0.0;
+      return Index3(-1, -1, -1);
+    }
+  }
 };
 
 // Global context pointer (managed by Python)
@@ -1333,6 +1520,25 @@ Index3 fft_search_with_gpu_context(const FlatVoxelGrid& item, bool& found, doubl
   return g_gpu_context->search_on_gpu(item, found, score, hi);
 }
 
+// Search with interlocking-free constraint (Section 4.3).
+// Only finds positions where the object can be placed AND removed without interlocking.
+Index3 fft_search_with_gpu_context_interlocking_free(const FlatVoxelGrid& item, bool& found, double& score) {
+  SCOPED_TIMER("gpu_context_search_interlocking_free_total");
+
+  if (!g_gpu_context || !g_gpu_context->initialized) {
+    throw std::runtime_error("GPU tray context not initialized");
+  }
+
+  // Get item bounds for OOB checking
+  Index3 tray_size = g_gpu_context->tray_size;
+  FlatVoxelGrid padded_item = item;
+  padto3d_flat(padded_item, tray_size);
+  Index3 lo, hi;
+  get_voxel_grid_bounds_flat(padded_item, lo, hi);
+
+  return g_gpu_context->search_on_gpu_interlocking_free(item, found, score, hi);
+}
+
 // =============================================================================
 // Batch Orientation Processing
 // =============================================================================
@@ -1375,6 +1581,52 @@ void fft_search_batch(const std::vector<FlatVoxelGrid>& orientations,
       best_position = position;
       found = true;
       best_score = orientation_score;
+    }
+  }
+}
+
+// Batch search with interlocking-free constraint (Section 4.3)
+void fft_search_batch_interlocking_free(const std::vector<FlatVoxelGrid>& orientations,
+                                         Index3& best_position, bool& found, double& best_score,
+                                         int& best_orientation_idx) {
+  SCOPED_TIMER("batch_search_interlocking_free_total");
+
+  if (!g_gpu_context || !g_gpu_context->initialized) {
+    throw std::runtime_error("GPU tray context not initialized");
+  }
+
+  Index3 tray_size = g_gpu_context->tray_size;
+  best_position = Index3(-1, -1, -1);
+  found = false;
+  best_score = 1e30;
+  best_orientation_idx = -1;
+
+  for (int i = 0; i < static_cast<int>(orientations.size()); i++) {
+    const auto& item = orientations[i];
+
+    // Skip if item is larger than tray
+    if (item.nx > std::get<0>(tray_size) ||
+        item.ny > std::get<1>(tray_size) ||
+        item.nz > std::get<2>(tray_size)) {
+      continue;
+    }
+
+    // Get item bounds
+    FlatVoxelGrid padded_item = item;
+    padto3d_flat(padded_item, tray_size);
+    Index3 lo, hi;
+    get_voxel_grid_bounds_flat(padded_item, lo, hi);
+
+    bool orientation_found = false;
+    double orientation_score = 0.0;
+    Index3 position = g_gpu_context->search_on_gpu_interlocking_free(
+        item, orientation_found, orientation_score, hi);
+
+    if (orientation_found && orientation_score < best_score) {
+      best_position = position;
+      found = true;
+      best_score = orientation_score;
+      best_orientation_idx = i;
     }
   }
 }

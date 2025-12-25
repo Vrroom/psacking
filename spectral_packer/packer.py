@@ -187,6 +187,10 @@ class BinPacker:
         Valid values: 1 (original only), 4 (Z-axis rotations),
         6 (one per face), 24 (all cube symmetries).
         More orientations = better packing but slower.
+    interlocking_free : bool, default False
+        If True, only place items in positions where they can be removed
+        without colliding with other items (Section 4.3 of the paper).
+        This results in lower packing density but guarantees no interlocking.
 
     Attributes
     ----------
@@ -198,6 +202,8 @@ class BinPacker:
         Height penalty factor.
     num_orientations : int
         Number of orientations to sample.
+    interlocking_free : bool
+        Whether to enforce interlocking-free placement.
 
     Examples
     --------
@@ -226,6 +232,7 @@ class BinPacker:
         voxel_resolution: int = 128,
         height_penalty: float = 1e8,
         num_orientations: int = 1,
+        interlocking_free: bool = False,
     ):
         if len(tray_size) != 3:
             raise ValueError(f"tray_size must be a 3-tuple, got {len(tray_size)} elements")
@@ -240,6 +247,7 @@ class BinPacker:
         self.voxel_resolution = voxel_resolution
         self.height_penalty = height_penalty
         self.num_orientations = num_orientations
+        self.interlocking_free = interlocking_free
         self._voxelizer = Voxelizer(resolution=voxel_resolution)
 
     def pack_files(
@@ -389,6 +397,7 @@ class BinPacker:
         from . import (
             fft_search_placement,
             fft_search_placement_with_cache,
+            fft_search_batch_interlocking_free,
             place_in_tray,
             calculate_distance,
         )
@@ -448,28 +457,52 @@ class BinPacker:
             orientations = get_orientations(item, self.num_orientations)
 
             # Pre-compute distance field ONCE per item (not per orientation)
-            if self.num_orientations > 1:
+            if self.num_orientations > 1 or self.interlocking_free:
                 tray_distance = calculate_distance(tray)
 
-            for orient_idx, rotated_item in enumerate(orientations):
-                rotated_item = make_contiguous(rotated_item.astype(np.int32))
+            if self.interlocking_free:
+                # Use batch interlocking-free search (Section 4.3)
+                # Filter orientations that fit in tray
+                valid_orientations = []
+                valid_orient_indices = []
+                for orient_idx, rotated_item in enumerate(orientations):
+                    rotated_item = make_contiguous(rotated_item.astype(np.int32))
+                    if not any(rotated_item.shape[i] > self.tray_size[i] for i in range(3)):
+                        valid_orientations.append(rotated_item)
+                        valid_orient_indices.append(orient_idx)
 
-                if any(rotated_item.shape[i] > self.tray_size[i] for i in range(3)):
-                    continue
-
-                if self.num_orientations > 1:
-                    position, found, score = fft_search_placement_with_cache(
-                        rotated_item, tray, tray_distance, generation
+                if valid_orientations:
+                    position, found, score, batch_orient_idx = fft_search_batch_interlocking_free(
+                        valid_orientations, tray, tray_distance, generation
                     )
-                else:
-                    position, found, score = fft_search_placement(rotated_item, tray)
+                    if found and batch_orient_idx >= 0:
+                        best_position = position
+                        best_score = score
+                        # Map back to original orientation index
+                        best_orientation_idx = valid_orient_indices[batch_orient_idx]
+                        best_rotated_item = valid_orientations[batch_orient_idx]
+                        found_any = True
+            else:
+                # Standard search (no interlocking constraint)
+                for orient_idx, rotated_item in enumerate(orientations):
+                    rotated_item = make_contiguous(rotated_item.astype(np.int32))
 
-                if found and score < best_score:
-                    best_position = position
-                    best_score = score
-                    best_orientation_idx = orient_idx
-                    best_rotated_item = rotated_item
-                    found_any = True
+                    if any(rotated_item.shape[i] > self.tray_size[i] for i in range(3)):
+                        continue
+
+                    if self.num_orientations > 1:
+                        position, found, score = fft_search_placement_with_cache(
+                            rotated_item, tray, tray_distance, generation
+                        )
+                    else:
+                        position, found, score = fft_search_placement(rotated_item, tray)
+
+                    if found and score < best_score:
+                        best_position = position
+                        best_score = score
+                        best_orientation_idx = orient_idx
+                        best_rotated_item = rotated_item
+                        found_any = True
 
             if found_any:
                 item_id = id_offset + num_placed + 1

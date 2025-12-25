@@ -41,6 +41,11 @@ Index3 fft_search_with_gpu_context(const FlatVoxelGrid& item, bool& found, doubl
 void fft_search_batch(const std::vector<FlatVoxelGrid>& orientations,
                       Index3& best_position, bool& found, double& best_score);
 
+// Batch orientation processing with interlocking-free constraint - Section 4.3 (from fft3.cu)
+void fft_search_batch_interlocking_free(const std::vector<FlatVoxelGrid>& orientations,
+                                         Index3& best_position, bool& found, double& best_score,
+                                         int& best_orientation_idx);
+
 // GPU flood fill for interlocking detection - Algorithm 3 (from fft3.cu)
 void gpu_interlocking_free_positions(const int* h_collision_metric, int* h_result,
                                      int nx, int ny, int nz,
@@ -497,6 +502,47 @@ py::tuple py_fft_search_batch(
     return py::make_tuple(py::make_tuple(x, y, z), found, best_score);
 }
 
+/**
+ * Search all orientations with interlocking-free constraint (Section 4.3).
+ * Only considers positions where the object can be placed AND removed without interlocking.
+ *
+ * @param orientations List of 3D int32 arrays, one per orientation
+ * @param tray 3D int32 array representing current tray state
+ * @param tray_distance Pre-computed distance field
+ * @param generation Tray version number for cache invalidation
+ * @return tuple of (position, found, score) for the best orientation
+ */
+py::tuple py_fft_search_batch_interlocking_free(
+    py::list orientations,
+    py::array_t<int> tray,
+    py::array_t<int> tray_distance,
+    uint64_t generation
+) {
+    FlatVoxelGrid tray_flat = numpy_to_flat_grid(tray);
+    FlatVoxelGrid tray_phi_flat = numpy_to_flat_grid(tray_distance);
+
+    if (!gpu_tray_context_is_initialized() || generation != g_cached_generation) {
+        gpu_tray_context_init(tray_flat, tray_phi_flat);
+        g_cached_generation = generation;
+    }
+
+    std::vector<FlatVoxelGrid> orientation_grids;
+    orientation_grids.reserve(py::len(orientations));
+    for (auto item : orientations) {
+        auto arr = item.cast<py::array_t<int>>();
+        orientation_grids.push_back(numpy_to_flat_grid(arr));
+    }
+
+    Index3 best_position;
+    bool found = false;
+    double best_score = 0.0;
+    int best_orientation_idx = -1;
+    fft_search_batch_interlocking_free(orientation_grids, best_position, found, best_score, best_orientation_idx);
+
+    auto [x, y, z] = best_position;
+    return py::make_tuple(py::make_tuple(x, y, z), found, best_score, best_orientation_idx);
+}
+
 // ============================================================================
 // GPU Interlocking-Free Positions (Algorithm 3)
 // ============================================================================
@@ -827,6 +873,31 @@ PYBIND11_MODULE(_core, m) {
               -------
               tuple
                   (position, found, score) for the best orientation
+          )pbdoc");
+
+    m.def("fft_search_batch_interlocking_free", &py_fft_search_batch_interlocking_free,
+          py::arg("orientations"), py::arg("tray"), py::arg("tray_distance"), py::arg("generation"),
+          R"pbdoc(
+              Batch search with interlocking-free constraint (Section 4.3).
+
+              Only considers positions where the object can be placed AND removed
+              without colliding with existing objects (interlocking-free).
+
+              Parameters
+              ----------
+              orientations : list of numpy.ndarray
+                  List of 3D int32 arrays, one per orientation
+              tray : numpy.ndarray
+                  3D int32 array representing current tray state
+              tray_distance : numpy.ndarray
+                  Pre-computed distance field from calculate_distance(tray)
+              generation : int
+                  Tray version number (increment after each placement)
+
+              Returns
+              -------
+              tuple
+                  (position, found, score, orientation_idx) for the best interlocking-free orientation
           )pbdoc");
 
     // GPU Interlocking-Free Positions (Algorithm 3)
