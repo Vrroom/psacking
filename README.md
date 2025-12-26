@@ -30,10 +30,9 @@ and optimal placement finding.
 ## Features
 
 - **GPU-accelerated packing** using CUDA FFT operations
-- **Multiple mesh formats**: STL, OBJ, PLY, OFF, GLTF, 3MF, and more
+- **STL mesh support** with C++ voxelization
 - **Simple Python API** with NumPy integration
-- **Automatic mesh validation and repair** via trimesh
-- **High-level and low-level APIs** for different use cases
+- **Blender export** for visualization and rendering
 
 ## Requirements
 
@@ -58,8 +57,8 @@ and optimal placement finding.
 
 ```bash
 # Clone the repository
-git clone <repository-url>
-cd sc3344_final_cpsc424
+git clone https://github.com/Vrroom/psacking.git
+cd psacking
 
 # Install build dependencies
 pip install scikit-build-core pybind11 cmake ninja
@@ -106,66 +105,21 @@ print(f"Packed {result.num_placed}/{len(items)} items")
 print(f"Packing density: {result.density:.1%}")
 ```
 
-### Packing from Mesh Files
+### Packing from STL Files
 
 ```python
 from spectral_packer import BinPacker
 
 packer = BinPacker(tray_size=(100, 100, 100))
 
-# Pack directly from mesh files
+# Pack directly from STL files
 result = packer.pack_files([
     "item1.stl",
-    "item2.obj",
-    "item3.ply"
+    "item2.stl",
+    "item3.stl"
 ])
 
 print(result.summary())
-```
-
-### Loading Meshes
-
-```python
-from spectral_packer import load_mesh, get_mesh_info
-
-# Get mesh information
-info = get_mesh_info("model.stl")
-print(f"Vertices: {info['num_vertices']}")
-print(f"Watertight: {info['is_watertight']}")
-
-# Load and optionally center/scale
-vertices, faces = load_mesh(
-    "model.stl",
-    validate=True,
-    repair=True,
-    center=True,
-    scale=1.0
-)
-```
-
-### Low-Level API
-
-```python
-from spectral_packer import (
-    fft_search_placement,
-    place_in_tray,
-    voxelize_stl,
-    calculate_distance
-)
-
-# Voxelize an STL file
-item = voxelize_stl("model.stl", resolution=128)
-
-# Create an empty tray
-tray = np.zeros((100, 100, 100), dtype=np.int32)
-
-# Find optimal placement
-position, found, score = fft_search_placement(item, tray)
-
-if found:
-    # Place the item
-    tray = place_in_tray(item, tray, position, item_id=1)
-    print(f"Placed at {position} with score {score:.2f}")
 ```
 
 ## API Reference
@@ -218,41 +172,6 @@ Voxelizer(resolution: int = 128)
 - `voxelize_file(path)` - Voxelize a mesh file
 - `voxelize_mesh(vertices, faces)` - Voxelize from arrays
 
-### Low-Level Functions
-
-| Function | Description |
-|----------|-------------|
-| `fft_search_placement(item, tray)` | Find optimal placement using FFT |
-| `place_in_tray(item, tray, pos, id)` | Place item at position |
-| `voxelize_stl(path, resolution)` | Voxelize STL file (C++) |
-| `dft_conv3(a, b)` | 3D FFT convolution |
-| `dft_corr3(a, b)` | 3D FFT cross-correlation |
-| `calculate_distance(grid)` | Compute distance field |
-| `collision_grid(tray, item)` | Compute collision metric |
-| `make_tight(grid)` | Remove empty borders |
-| `get_bounds(grid)` | Get bounding box of occupied voxels |
-| `save_vox(grid, path)` | Save to MagicaVoxel format |
-
-### Mesh I/O Functions
-
-| Function | Description |
-|----------|-------------|
-| `load_mesh(path, ...)` | Load mesh with optional validation/repair |
-| `get_mesh_info(path)` | Get mesh statistics without loading |
-| `SUPPORTED_FORMATS` | Dict of supported file formats |
-
-## Supported Mesh Formats
-
-| Format | Extension | Notes |
-|--------|-----------|-------|
-| STL | .stl | Binary and ASCII |
-| Wavefront OBJ | .obj | With materials |
-| Stanford PLY | .ply | Binary and ASCII |
-| OFF | .off | Object File Format |
-| GLTF | .gltf, .glb | GL Transmission Format |
-| 3MF | .3mf | 3D Manufacturing Format |
-| COLLADA | .dae | XML-based format |
-
 ## Algorithm
 
 The spectral packing algorithm works as follows:
@@ -265,17 +184,40 @@ The spectral packing algorithm works as follows:
    - Height penalty (prefers bottom placements)
 4. **Greedy Placement**: Place items one by one in descending volume order
 
-The key insight is that collision detection can be formulated as a
-convolution, which can be computed efficiently using FFT in O(n log n)
-time rather than O(n²) for naive approaches.
-
 ## Examples
 
 See the `examples/` directory for complete examples:
 
 - `basic_packing.py` - Simple packing demonstration
-- `multi_format_demo.py` - Loading various mesh formats
 - `benchmark.py` - Performance benchmarking
+- `github_teaser.py` - Generate the README teaser renders (requires Blender)
+
+### Blender Export Example
+
+The teaser images at the top of this README were generated using `examples/github_teaser.py`. This script:
+
+1. Filters Thingi10K objects to similar physical sizes (20-50mm)
+2. Uses pitch=1.0 so 1 voxel = 1mm
+3. Packs into a 240×123×100mm tray
+4. Exports to Blender and renders high-quality images
+
+```bash
+# Run from project root (requires Blender with spectral_packer installed)
+~/blender-4.5.0-linux-x64/blender --background --python examples/github_teaser.py
+```
+
+To install `spectral_packer` for Blender's Python:
+
+```bash
+# Find Blender's Python
+BLENDER_PYTHON=~/blender-4.5.0-linux-x64/4.5/python/bin/python3.11
+
+# Install dependencies
+$BLENDER_PYTHON -m pip install numpy trimesh
+
+# Install spectral_packer
+$BLENDER_PYTHON -m pip install -e /path/to/psacking
+```
 
 ## Running Tests
 
