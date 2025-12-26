@@ -30,7 +30,6 @@ and optimal placement finding.
 ## Features
 
 - **GPU-accelerated packing** using CUDA FFT operations
-- **STL mesh support** with C++ voxelization
 - **Simple Python API** with NumPy integration
 - **Blender export** for visualization and rendering
 
@@ -176,7 +175,7 @@ Voxelizer(resolution: int = 128)
 
 The spectral packing algorithm works as follows:
 
-1. **Voxelization**: Convert 3D meshes to binary occupancy grids
+1. **Voxelization**: Convert 3D meshes to binary occupancy grids (using [VoxSurf](https://github.com/sylefeb/VoxSurf))
 2. **Collision Detection**: Use FFT correlation to efficiently compute
    where items can be placed without collision
 3. **Scoring**: For each valid position, compute a score based on:
@@ -303,3 +302,4 @@ If you use this code in your research, please cite the original paper:
 - [Dense, Interlocking-Free and Scalable Spectral Packing of Generic 3D Objects](https://inkbit3d.com/packing/) - Original paper (SIGGRAPH 2023)
 - [pybind11](https://pybind11.readthedocs.io/) - C++/Python bindings
 - [trimesh](https://trimsh.org/) - Mesh processing library
+- [VoxSurf](https://github.com/sylefeb/VoxSurf) - For extracting voxels from STL
