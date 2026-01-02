@@ -27,6 +27,8 @@ This library implements the spectral packing algorithm described in
 Fast Fourier Transform (FFT) operations for efficient collision detection
 and optimal placement finding.
 
+[Original Paper Link (Not Mine)](https://dl.acm.org/doi/epdf/10.1145/3592126)
+
 ## Features
 
 - **GPU-accelerated packing** using CUDA FFT operations
