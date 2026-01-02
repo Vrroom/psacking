@@ -22,7 +22,7 @@
 
 GPU-accelerated 3D bin packing using FFT-based collision detection.
 
-This library implements the spectral packing algorithm described in
+This library implements (unofficially) the spectral packing algorithm described in
 [Dense, Interlocking-Free and Scalable Spectral Packing of Generic 3D Objects](https://dl.acm.org/doi/epdf/10.1145/3592126) (SIGGRAPH 2023), which uses
 Fast Fourier Transform (FFT) operations for efficient collision detection
 and optimal placement finding.
